@@ -1,0 +1,62 @@
+# =========================
+# Next.js (Frontend)
+# =========================
+# dependencies
+frontend/node_modules/
+frontend/.pnp
+frontend/.pnp.*
+frontend/.yarn/*
+!frontend/.yarn/patches
+!frontend/.yarn/plugins
+!frontend/.yarn/releases
+!frontend/.yarn/versions
+
+# testing
+frontend/coverage/
+
+# Next.js build output
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# debug
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.pnpm-debug.log*
+
+# Vercel
+frontend/.vercel
+
+# typescript
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+
+# Variáveis de ambiente
+frontend/.env
+frontend/.env.*
+frontend/.env*.local
+!frontend/.env.example
+
+# =========================
+# .NET / C# (Backend)
+# =========================
+# Pastas de compilação (Arquivos binários pesados)
+backend/bin/
+backend/obj/
+
+# Arquivo de configuração sensível local
+backend/appsettings.Development.json
+backend/appsettings.*.json
+
+# Arquivos de cache e usuário do Visual Studio / VS Code
+*.user
+*.suo
+.vscode/
+
+# =========================
+# OS / Geral
+# =========================
+.DS_Store
+Thumbs.db
+*.pem
