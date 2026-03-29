@@ -1,9 +1,11 @@
 using ApiAssistente.Controllers;
 
 var builder = WebApplication.CreateBuilder(args);
+const string OpenRouterApiKeyMissingMessage =
+    "OpenRouterApiKey nao configurada. Defina a chave via variavel de ambiente, dotnet user-secrets ou appsettings.Development.json local.";
 
 // ==========================================
-// 1. SERVIÇOS
+// 1. SERVI?OS
 // ==========================================
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -16,8 +18,12 @@ builder.Services.AddControllers()
         );
     });
 
-// ALTERAÇÃO: Tipado para injetar corretamente no PromptController
-builder.Services.AddHttpClient<PromptController>();
+// ALTERA??O: Tipado para injetar corretamente no PromptController
+builder.Services.AddHttpClient<PromptController>(client =>
+{
+    // Timeout global generoso ? cada chamada individual tem seu pr?prio CancellationToken de 90s
+    client.Timeout = TimeSpan.FromMinutes(8);
+});
 
 // CORS para o Next.js
 builder.Services.AddCors(options =>
@@ -31,7 +37,7 @@ builder.Services.AddCors(options =>
 });
 
 // ==========================================
-// 2. CONSTRUÇÃO DA APLICAÇÃO
+// 2. CONSTRU??O DA APLICA??O
 // ==========================================
 var app = builder.Build();
 
@@ -44,7 +50,7 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// UseHttpsRedirection removido — em dev local só usamos HTTP (localhost:5117)
+// UseHttpsRedirection removido ? em dev local s? usamos HTTP (localhost:5117)
 app.UseCors("PermitirNextJs");
 app.UseAuthorization();
 app.MapControllers();
@@ -59,13 +65,13 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
     var apiKey = config["OpenRouterApiKey"]?.Trim();
 
     if (string.IsNullOrEmpty(apiKey))
-        return Results.BadRequest(new { erro = "OpenRouterApiKey não encontrada no appsettings.json" });
+        return Results.Json(new { erro = OpenRouterApiKeyMissingMessage }, statusCode: StatusCodes.Status503ServiceUnavailable);
 
     var modelos = new[]
     {
-        new { nome = "Análise",   id = "arcee-ai/trinity-large-preview:free",           etapa = 1 },
-        new { nome = "Geração",   id = "meta-llama/llama-3.3-70b-instruct:free",        etapa = 2 },
-        new { nome = "Validação", id = "mistralai/mistral-small-3.1-24b-instruct:free", etapa = 3 },
+        new { nome = "An?lise",   id = "arcee-ai/trinity-large-preview:free",           etapa = 1 },
+        new { nome = "Gera??o",   id = "meta-llama/llama-3.3-70b-instruct:free",        etapa = 2 },
+        new { nome = "Valida??o", id = "mistralai/mistral-small-3.1-24b-instruct:free", etapa = 3 },
     };
 
     var resultados = new List<object>();
@@ -107,7 +113,7 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
             {
                 var node = System.Text.Json.Nodes.JsonNode.Parse(json);
                 var texto = node?["choices"]?[0]?["message"]?["content"]?.ToString();
-                status  = "✅ online";
+                status  = "? online";
                 detalhe = string.IsNullOrWhiteSpace(texto) ? "Respondeu (sem texto)" : $"Respondeu: \"{texto.Trim()}\"";
             }
             else
@@ -115,13 +121,13 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
                 // Tenta extrair a mensagem de erro do OpenRouter
                 var node = System.Text.Json.Nodes.JsonNode.Parse(json);
                 var msg  = node?["error"]?["message"]?.ToString() ?? resposta.StatusCode.ToString();
-                status  = "❌ offline";
+                status  = "? offline";
                 detalhe = msg;
             }
         }
         catch (Exception ex)
         {
-            status  = "❌ erro";
+            status  = "? erro";
             detalhe = ex.Message;
         }
 
@@ -143,7 +149,7 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
     return Results.Ok(new
     {
         pipeline_pronto = resultados.Cast<dynamic>().All(r => ((string)r.status).Contains("online")),
-        resumo          = $"{resultados.Count(r => r.ToString()!.Contains("online"))}/3 modelos disponíveis",
+        resumo          = $"{resultados.Count(r => r.ToString()!.Contains("online"))}/3 modelos dispon?veis",
         modelos         = resultados
     });
 })
