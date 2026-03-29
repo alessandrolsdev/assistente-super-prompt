@@ -128,3 +128,17 @@ Para medir a disponibilidade dos modelos usados na pipeline, use o endpoint:
 ### Equipe de Engenharia / Maintenance
 
 Este monorepo foca em clareza estrutural, compatibilidade incremental e evolucao segura. Pull requests devem manter alinhamento entre codigo, contratos, documentacao e testes.
+## Testes do Backend
+
+Para executar a fundacao de testes do backend localmente:
+
+```bash
+# na raiz do repositorio
+dotnet test assistente-super-prompt.sln
+```
+
+Se quiser rodar apenas os testes do backend:
+
+```bash
+dotnet test backend/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+```
