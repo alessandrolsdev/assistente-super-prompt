@@ -44,6 +44,9 @@ frontend/.env*.local
 # Pastas de compila??o (Arquivos bin?rios pesados)
 backend/bin/
 backend/obj/
+backend/**/bin/
+backend/**/obj/
+backend/**/TestResults/
 
 # Arquivo de configura??o sens?vel local
 backend/appsettings.Development.json

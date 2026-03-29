@@ -8,6 +8,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="ApiAssistente.Tests\**\*.cs" />
+    <EmbeddedResource Remove="ApiAssistente.Tests\**\*" />
+    <None Remove="ApiAssistente.Tests\**\*" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.24" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
