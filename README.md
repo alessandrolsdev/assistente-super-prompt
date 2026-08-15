@@ -1,8 +1,6 @@
 # Agentic Prompt Builder
 
-![Banner Agentic Prompt Builder](https://raw.githubusercontent.com/OpenRouter/OpenRouter/main/assets/readme-banner.png)
-
-Este projeto implementa uma arquitetura senior de "Agentic Prompting", utilizando uma pipeline de multiplos agentes LLM atraves do [OpenRouter](https://openrouter.ai).
+Este projeto implementa uma arquitetura de "Agentic Prompting", utilizando uma pipeline de multiplos agentes LLM atraves do [OpenRouter](https://openrouter.ai).
 
 O objetivo e pegar uma ideia bruta do usuario e passar por etapas de classificacao, clarificacao, triagem, analise, geracao e validacao ate transforma-la em um prompt otimizado e operacional.
 
@@ -12,11 +10,15 @@ O objetivo e pegar uma ideia bruta do usuario e passar por etapas de classificac
 
 O motor C# (backend) orquestra chamadas de modelos com funcoes especificas. O frontend atua como a interface reativa dessas etapas:
 
-1. Agente de triagem de complexidade: detecta quando um pedido precisa ser quebrado em sub-tarefas.
-2. Agente de identificacao de papel e formato: define quem o LLM final precisa ser e como deve responder.
-3. Agente analitico: encontra lacunas, riscos e gotchas tecnicos.
-4. Agente gerador: monta o super prompt com base no contexto enriquecido.
-5. Agente avaliador: valida o prompt e retorna uma versao refinada com score de qualidade.
+1. Agente classificador: identifica o tipo de objetivo (imagem, video, codigo, refatoracao, copy, UI, outro).
+2. Agente de ambiguidade: detecta termos ambiguos e devolve ate 2 perguntas de clarificacao.
+3. Agente de triagem de complexidade: detecta quando um pedido precisa ser quebrado em sub-tarefas.
+4. Agente de identificacao de papel e formato: define quem o LLM final precisa ser e como deve responder.
+5. Agente analitico: encontra lacunas, riscos e gotchas tecnicos.
+6. Agente gerador: monta o super prompt com base no contexto enriquecido.
+7. Agente avaliador: valida o prompt e retorna uma versao refinada com score de qualidade.
+
+O modelo usado em cada etapa e configuravel (ver [Configuracao do OpenRouter](#configuracao-do-openrouter)).
 
 ---
 
@@ -24,8 +26,8 @@ O motor C# (backend) orquestra chamadas de modelos com funcoes especificas. O fr
 
 ### Frontend
 
-- Framework: Next.js (App Router)
-- Engine UI: React
+- Framework: Next.js 16 (App Router)
+- Engine UI: React 19
 - Linguagem: TypeScript
 - Styling/Animations: Tailwind CSS e Framer Motion
 - Icones: Lucide React
@@ -41,7 +43,7 @@ O motor C# (backend) orquestra chamadas de modelos com funcoes especificas. O fr
 
 ## Variaveis de Ambiente e Configuracao
 
-### Backend (`OpenRouterApiKey`)
+### Backend: chave da API (`OpenRouterApiKey`)
 
 O backend aceita `OpenRouterApiKey` pelas fontes padrao do ASP.NET Core. Para desenvolvimento local, use nesta ordem de preferencia:
 
@@ -49,37 +51,48 @@ O backend aceita `OpenRouterApiKey` pelas fontes padrao do ASP.NET Core. Para de
 2. `dotnet user-secrets`
 3. `backend/appsettings.Development.json` local e ignorado
 
-### Opcao 1: variavel de ambiente
+#### Opcao 1: variavel de ambiente
 
 ```powershell
 $env:OpenRouterApiKey="sk-or-v1-SUA-CHAVE"
 ```
 
-### Opcao 2: `dotnet user-secrets`
+#### Opcao 2: `dotnet user-secrets`
 
 ```bash
 cd backend
 dotnet user-secrets set "OpenRouterApiKey" "sk-or-v1-SUA-CHAVE"
 ```
 
-### Opcao 3: arquivo local ignorado
+#### Opcao 3: arquivo local ignorado
 
-Use [backend/appsettings.Example.json](backend/appsettings.Example.json) como referencia e crie um `backend/appsettings.Development.json` apenas no seu ambiente local:
+Use [backend/appsettings.Example.json](backend/appsettings.Example.json) como referencia e crie um `backend/appsettings.Development.json` apenas no seu ambiente local.
 
-```json
-{
-  "Logging": {
-    "LogLevel": {
-      "Default": "Information",
-      "Microsoft.AspNetCore": "Warning"
-    }
-  },
-  "AllowedHosts": "*",
-  "OpenRouterApiKey": "sk-or-v1-SUA-CHAVE"
-}
+Nao armazene segredos reais em arquivos rastreados.
+
+### Configuracao do OpenRouter
+
+Alem da chave, a secao `OpenRouter` permite ajustar o pipeline sem recompilar. Todos os campos sao opcionais e caem para os padroes do codigo:
+
+| Chave | Padrao | Para que serve |
+| --- | --- | --- |
+| `OpenRouter:ApiKey` | — | Alternativa a `OpenRouterApiKey` na raiz |
+| `OpenRouter:BaseUrl` | endpoint de chat do OpenRouter | Trocar o provedor ou apontar para um mock |
+| `OpenRouter:MaxTokens` | `4096` | Teto de tokens por chamada |
+| `OpenRouter:TimeoutSeconds` | `90` | Timeout de cada chamada individual |
+| `OpenRouter:Models:*` | ver exemplo | Modelo de cada etapa do pipeline |
+| `OpenRouter:Models:GeracaoFallback` | 4 modelos | Cadeia de fallback da etapa de geracao |
+| `Cors:AllowedOrigins` | `["http://localhost:3000"]` | Origens liberadas para o frontend |
+
+Os ids de modelo default sao modelos gratuitos do OpenRouter e mudam de disponibilidade com frequencia. Use `GET /api/modelos/testar` para confirmar quais estao respondendo antes de investigar erros no pipeline.
+
+### Frontend: URL da API
+
+Copie [frontend/.env.example](frontend/.env.example) para `frontend/.env.local` e ajuste se o backend nao estiver em `http://localhost:5117`:
+
+```bash
+NEXT_PUBLIC_API_BASE_URL=http://localhost:5117
 ```
-
-Nao armazene segredos reais em arquivos rastreados. `GeminiApiKey` nao e usada pelo backend atual e nao deve fazer parte do setup local.
 
 ---
 
@@ -116,12 +129,38 @@ _O frontend fica disponivel em `http://localhost:3000`._
 
 ---
 
+## Verificacoes Locais
+
+```bash
+# Frontend: tipos, lint e build de producao
+cd frontend
+npm run check
+
+# Backend
+cd backend
+dotnet build
+```
+
+Ainda nao existe suite de testes automatizados nem CI. Veja o [relatorio de auditoria](docs/audit/2026-08-auditoria.md) e o [target state](docs/architecture/target-state.md).
+
+---
+
 ## Endpoint de Self-Diagnostics
 
 Para medir a disponibilidade dos modelos usados na pipeline, use o endpoint:
 
 - `GET http://localhost:5117/api/modelos/testar`
+- Testa exatamente os modelos configurados em `OpenRouter:Models`, um por vez, e devolve status, detalhe e latencia de cada um.
 - Se `OpenRouterApiKey` nao estiver configurada, o endpoint retorna `503 Service Unavailable` com uma mensagem de configuracao ausente.
+
+---
+
+## Documentacao
+
+- [ADR-001: Modular Monolith First](docs/architecture/adr-001-modular-monolith-first.md)
+- [Current State](docs/architecture/current-state.md)
+- [Target State](docs/architecture/target-state.md)
+- [Auditoria de codigo (2026-08)](docs/audit/2026-08-auditoria.md)
 
 ---
 

@@ -1,0 +1,23 @@
+# Guardrail de encoding: os arquivos do backend já foram corrompidos uma vez por
+# um editor gravando em code page local (acentos viraram "?" e U+FFFD dentro dos
+# prompts enviados ao LLM). charset = utf-8 evita a reincidência.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.cs]
+indent_size = 4
+
+[*.{js,jsx,ts,tsx,json,css,yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{sln,csproj}]
+indent_size = 2

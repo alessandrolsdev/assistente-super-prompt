@@ -1,8 +1,13 @@
-using Microsoft.AspNetCore.Mvc;
-using ApiAssistente.Models;
-using System.Text.Json;
+using System.Globalization;
+using System.Net;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using ApiAssistente.Configuration;
+using ApiAssistente.Models;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace ApiAssistente.Controllers;
 
@@ -10,93 +15,77 @@ namespace ApiAssistente.Controllers;
 [Route("api/[controller]")]
 public class PromptController : ControllerBase
 {
-    private const string OpenRouterApiKeyMissingMessage =
-        "OpenRouterApiKey nao configurada. Defina a chave via variavel de ambiente, dotnet user-secrets ou appsettings.Development.json local.";
     private readonly HttpClient _httpClient;
-    private readonly string? _openRouterApiKey;
+    private readonly OpenRouterOptions _options;
+    private readonly ILogger<PromptController> _logger;
 
-    private const string MODELO_CLASSIFICADOR = "arcee-ai/trinity-large-preview:free";
-    private const string MODELO_AMBIGUIDADE   = "arcee-ai/trinity-large-preview:free";
-    // -- MODELOS: fallback autom�tico se modelo retornar vazio -----------------
-    private static readonly string[] MODELOS_GERACAO_FALLBACK = {
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "mistralai/mistral-small-3.1-24b-instruct:free",
-        "qwen/qwen3-8b:free",
-    };
-    private static string MODELO_GERACAO  => MODELOS_GERACAO_FALLBACK[0];
-    private const string MODELO_TRIAGEM   = "google/gemini-2.0-flash-exp:free";
-    private const string MODELO_DETECCAO  = "google/gemini-2.0-flash-exp:free";
-    private const string MODELO_ANALISE   = "google/gemini-2.0-flash-exp:free";
-    private const string MODELO_VALIDACAO = "meta-llama/llama-3.3-70b-instruct:free";
-    private const string OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions";
+    private PipelineModelOptions Modelos => _options.Models;
 
-    public PromptController(HttpClient httpClient, IConfiguration configuration)
+    public PromptController(
+        IHttpClientFactory httpClientFactory,
+        IOptions<OpenRouterOptions> options,
+        ILogger<PromptController> logger)
     {
-        _httpClient = httpClient;
-        _openRouterApiKey = configuration["OpenRouterApiKey"]?.Trim();
+        _options = options.Value;
+        _logger = logger;
+        _httpClient = httpClientFactory.CreateClient(OpenRouterOptions.HttpClientName);
     }
 
     // ------------------------------------------------------------
     // POST /api/prompt/gerar
     // ------------------------------------------------------------
     [HttpPost("gerar")]
-    public async Task<IActionResult> GerarPrompt([FromBody] PromptRequest request)
+    public async Task<IActionResult> GerarPrompt([FromBody] PromptRequest request, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(request.IdeiaBruta))
-            return BadRequest(new { erro = "ideiaBruta � obrigat�rio." });
+            return BadRequest(new { erro = "ideiaBruta é obrigatório." });
 
         var configError = ValidarConfiguracaoOpenRouter();
         if (configError is not null)
             return configError;
 
-        string modeloGeracaoUsado = MODELO_GERACAO;
-
         try
         {
-            string contextoImagem = "";
-
-            // -- ETAPA -2: CLASSIFICA��O DE OBJETIVO --------------------------
-            var tipoFinal = await ClassificarObjetivo(request.IdeiaBruta, contextoImagem, request.TipoSugerido);
-            Console.WriteLine($"[GerarPrompt] Tipo classificado: {tipoFinal}");
+            // -- ETAPA -2: CLASSIFICAÇÃO DE OBJETIVO --------------------------
+            var tipoFinal = await ClassificarObjetivo(request.IdeiaBruta, request.TipoSugerido, cancellationToken);
+            _logger.LogInformation("[GerarPrompt] Tipo classificado: {Tipo}", tipoFinal);
 
             var config = ObjetivoConfigs.Get(tipoFinal);
 
-            // -- ETAPA -1: DETEC��O DE AMBIGUIDADE ----------------------------
-            bool jaTemRespostas = request.RespostasClarificacao?.Count > 0;
+            // -- ETAPA -1: DETECÇÃO DE AMBIGUIDADE ----------------------------
+            var jaTemRespostas = request.RespostasClarificacao?.Count > 0;
             if (!request.ForcarSimples && !jaTemRespostas)
             {
-                var perguntas = await DetectarAmbiguidade(request.IdeiaBruta, tipoFinal);
+                var perguntas = await DetectarAmbiguidade(request.IdeiaBruta, tipoFinal, cancellationToken);
                 if (perguntas.Count > 0)
                 {
-                    Console.WriteLine($"[GerarPrompt] {perguntas.Count} perguntas de clarifica��o geradas");
+                    _logger.LogInformation("[GerarPrompt] {Total} perguntas de clarificação geradas", perguntas.Count);
                     return Ok(new
                     {
                         tipo_resposta   = "clarificacao_necessaria",
-                        perguntas       = perguntas,
+                        perguntas,
                         tipo_confirmado = tipoFinal.ToString(),
-                        pipeline = new { etapa_ambiguidade = new { modelo = MODELO_AMBIGUIDADE, resultado = "ambiguo" } }
+                        pipeline = new { etapa_ambiguidade = new { modelo = Modelos.Ambiguidade, resultado = "ambiguo" } }
                     });
                 }
             }
 
             // -- Enriquece ideia -----------------------------------------------
-            string ideiaEnriquecida = MontarIdeiaEnriquecida(
-                request.IdeiaBruta, contextoImagem, request.RespostasClarificacao, request.ExecutorAlvo
-            );
+            var ideiaEnriquecida = MontarIdeiaEnriquecida(
+                request.IdeiaBruta, request.RespostasClarificacao, request.ExecutorAlvo);
 
-            // -- TRIAGEM (s� para c�digo/refatora��o/UI/outro) -----------------
-            bool tipoExigeTriagem = tipoFinal == TipoObjetivo.Codigo
-                                 || tipoFinal == TipoObjetivo.Refatoracao
-                                 || tipoFinal == TipoObjetivo.DesignUI
-                                 || tipoFinal == TipoObjetivo.Outro;
+            // -- TRIAGEM (só para código/refatoração/UI/outro) -----------------
+            var tipoExigeTriagem = tipoFinal is TipoObjetivo.Codigo
+                                              or TipoObjetivo.Refatoracao
+                                              or TipoObjetivo.DesignUI
+                                              or TipoObjetivo.Outro;
 
             if (!request.ForcarSimples && tipoExigeTriagem)
             {
-                var triagem = await TriarComplexidade(ideiaEnriquecida);
+                var triagem = await TriarComplexidade(ideiaEnriquecida, cancellationToken);
                 if (triagem.isComplexo)
                 {
-                    Console.WriteLine($"[GerarPrompt] Triagem: complexo � {triagem.subTarefas.Count} sub-tarefas");
+                    _logger.LogInformation("[GerarPrompt] Triagem: complexo — {Total} sub-tarefas", triagem.subTarefas.Count);
                     return Ok(new
                     {
                         tipo_resposta   = "plano_de_divisao",
@@ -104,62 +93,70 @@ public class PromptController : ControllerBase
                         sub_tarefas     = triagem.subTarefas,
                         recomendacao    = triagem.recomendacao,
                         tipo_confirmado = tipoFinal.ToString(),
-                        pipeline = new { etapa_triagem = new { modelo = MODELO_TRIAGEM, resultado = "complexo" } }
+                        pipeline = new { etapa_triagem = new { modelo = Modelos.Triagem, resultado = "complexo" } }
                     });
                 }
             }
 
             // -- ETAPA 0: PAPEL + FORMATO --------------------------------------
-            var deteccao = await DetectarPapelEFormato(ideiaEnriquecida, request.Papel, config);
-            Console.WriteLine($"[GerarPrompt] Papel: {deteccao.papel[..Math.Min(80, deteccao.papel.Length)]}");
+            var deteccao = await DetectarPapelEFormato(ideiaEnriquecida, request.Papel, config, cancellationToken);
+            _logger.LogInformation("[GerarPrompt] Papel: {Papel}", Truncar(deteccao.papel, 80));
 
-            // -- ETAPA 1: AN�LISE ----------------------------------------------
-            var analise = await AnalisarPorTipo(ideiaEnriquecida, tipoFinal, deteccao.papel, config);
-            if (string.IsNullOrWhiteSpace(analise))
+            // -- ETAPA 1: ANÁLISE ----------------------------------------------
+            var analise = await AnalisarPorTipo(ideiaEnriquecida, tipoFinal, deteccao.papel, config, cancellationToken);
+            if (!analise.Sucesso)
             {
-                Console.WriteLine($"[GerarPrompt] ERRO: Etapa 1 (An�lise) retornou vazio. Tipo={tipoFinal}");
-                return StatusCode(500, new { erro = "Etapa 1 (An�lise) falhou � resposta vazia." });
+                _logger.LogError("[GerarPrompt] Etapa 1 (Análise) sem resposta. Tipo={Tipo} Erro={Erro}", tipoFinal, analise.Erro);
+                return FalhaUpstream("Etapa 1 (Análise)", analise);
             }
 
-            // -- ETAPA 2: GERA��O ----------------------------------------------
-            var (promptGerado, modeloReal) = await GerarPorTipo(
-                ideiaEnriquecida, tipoFinal, analise, deteccao.papel, deteccao.formato, config
-            );
-            modeloGeracaoUsado = modeloReal ?? MODELO_GERACAO;
+            // -- ETAPA 2: GERAÇÃO ----------------------------------------------
+            var geracao = await GerarPorTipo(
+                ideiaEnriquecida, tipoFinal, analise.Texto!, deteccao.papel, deteccao.formato, config, cancellationToken);
+            var modeloGeracaoUsado = geracao.ModeloUsado ?? Modelos.Geracao;
 
-            if (string.IsNullOrWhiteSpace(promptGerado))
+            if (!geracao.Sucesso)
             {
-                Console.WriteLine($"[GerarPrompt] ERRO: Etapa 2 (Gera��o) retornou vazio. Tipo={tipoFinal} Modelo={modeloGeracaoUsado}");
-                return StatusCode(500, new { erro = "Etapa 2 (Gera��o) falhou � prompt vazio." });
+                _logger.LogError("[GerarPrompt] Etapa 2 (Geração) sem resposta. Tipo={Tipo} Erro={Erro}", tipoFinal, geracao.Erro);
+                return FalhaUpstream("Etapa 2 (Geração)", geracao);
             }
-            Console.WriteLine($"[GerarPrompt] Prompt gerado ({promptGerado.Length} chars)");
 
-            // -- ETAPA 3: VALIDA��O --------------------------------------------
-            var validacao = await ValidarPorTipo(promptGerado, tipoFinal, config);
+            var promptGerado = geracao.Texto!;
+            _logger.LogInformation("[GerarPrompt] Prompt gerado ({Chars} chars) por {Modelo}", promptGerado.Length, modeloGeracaoUsado);
 
-            string? promptFinal = ExtrairTagXmlRobusto(validacao ?? "", "prompt_final");
-            bool promptFinalValido = promptFinal != null && promptFinal.Length > 80
-                && !promptFinal.StartsWith("Nenhum") && !promptFinal.StartsWith("Corrija");
+            // -- ETAPA 3: VALIDAÇÃO --------------------------------------------
+            // A validação é best-effort: se falhar, seguimos com o prompt da etapa 2.
+            var validacao = await ValidarPorTipo(promptGerado, tipoFinal, config, cancellationToken);
+            var textoValidacao = validacao.Texto ?? "";
 
-            if (!promptFinalValido && tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video)
-                promptFinalValido = promptFinal != null && promptFinal.Length > 50;
+            var promptFinal = ExtrairTagXmlRobusto(textoValidacao, "prompt_final");
+            var tamanhoMinimo = tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video ? 50 : 80;
+            var promptFinalValido = promptFinal is not null
+                && promptFinal.Length > tamanhoMinimo
+                && !promptFinal.StartsWith("Nenhum", StringComparison.OrdinalIgnoreCase)
+                && !promptFinal.StartsWith("Corrija", StringComparison.OrdinalIgnoreCase);
 
-            string resultadoFinal = promptFinalValido
+            var tagGeracao = tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video
+                ? "prompt_gerado"
+                : "prompt_otimizado";
+
+            var resultadoFinal = promptFinalValido
                 ? promptFinal!
-                : (tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video
-                    ? ExtrairTagXmlRobusto(promptGerado, "prompt_gerado") ?? promptGerado
-                    : ExtrairTagXmlRobusto(promptGerado, "prompt_otimizado") ?? promptGerado);
+                : ExtrairTagXmlRobusto(promptGerado, tagGeracao) ?? promptGerado;
 
             if (string.IsNullOrWhiteSpace(resultadoFinal))
             {
-                Console.WriteLine($"[GerarPrompt] ERRO: resultadoFinal vazio. promptGerado={promptGerado.Length}c validacao={validacao?.Length ?? 0}c");
-                return StatusCode(500, new { erro = "Resultado final vazio.", detalhes = new { promptGeradoLen = promptGerado.Length, validacaoLen = validacao?.Length } });
+                _logger.LogError(
+                    "[GerarPrompt] Resultado final vazio. promptGerado={GeradoLen}c validacao={ValidacaoLen}c",
+                    promptGerado.Length, textoValidacao.Length);
+                return StatusCode(StatusCodes.Status502BadGateway, new
+                {
+                    erro = "O modelo devolveu um resultado vazio. Tente novamente."
+                });
             }
 
-            string scoreRaw  = ExtrairTagXmlRobusto(validacao ?? "", "score") ?? "N/A";
-            var    scoreMatch = System.Text.RegularExpressions.Regex.Match(scoreRaw, @"\d+");
-            string score      = scoreMatch.Success ? scoreMatch.Value : "N/A";
-            Console.WriteLine($"[GerarPrompt] Score: {score} | Resultado: {resultadoFinal.Length} chars");
+            var score = ExtrairScore(textoValidacao);
+            _logger.LogInformation("[GerarPrompt] Score: {Score} | Resultado: {Chars} chars", score, resultadoFinal.Length);
 
             return Ok(new
             {
@@ -176,25 +173,25 @@ public class PromptController : ControllerBase
                 },
                 pipeline = new
                 {
-                    etapa_triagem   = new { modelo = MODELO_CLASSIFICADOR, funcao = "Classifica��o" },
-                    etapa_0         = new { modelo = MODELO_DETECCAO,      funcao = "Detec��o"      },
-                    etapa_1         = new { modelo = MODELO_ANALISE,       funcao = "An�lise"       },
-                    etapa_2         = new { modelo = modeloGeracaoUsado,   funcao = "Gera��o"       },
-                    etapa_3         = new { modelo = MODELO_VALIDACAO,     funcao = "Valida��o"     },
-                    score_qualidade = score.Trim()
+                    etapa_triagem   = new { modelo = Modelos.Classificador, funcao = "Classificação" },
+                    etapa_0         = new { modelo = Modelos.Deteccao,      funcao = "Detecção"      },
+                    etapa_1         = new { modelo = Modelos.Analise,       funcao = "Análise"       },
+                    etapa_2         = new { modelo = modeloGeracaoUsado,    funcao = "Geração"       },
+                    etapa_3         = new { modelo = Modelos.Validacao,     funcao = "Validação"     },
+                    score_qualidade = score
                 }
             });
         }
-        catch (HttpRequestException ex)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            Console.WriteLine($"[GerarPrompt] HttpRequestException: {ex.StatusCode} � {ex.Message}");
-            return StatusCode((int)(ex.StatusCode ?? System.Net.HttpStatusCode.InternalServerError),
-                new { erro = "Erro OpenRouter", detalhes = ex.Message });
+            // Cliente desistiu: não é erro do servidor e não precisa de corpo.
+            // 499 é a convenção (nginx) para "client closed request".
+            _logger.LogInformation("[GerarPrompt] Requisição cancelada pelo cliente.");
+            return StatusCode(499);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[GerarPrompt] Exception: {ex.GetType().Name} � {ex.Message}");
-            return StatusCode(500, new { erro = "Erro interno", detalhes = ex.Message });
+            return ErroInterno(ex, nameof(GerarPrompt));
         }
     }
 
@@ -202,12 +199,12 @@ public class PromptController : ControllerBase
     // POST /api/prompt/regerar
     // ------------------------------------------------------------
     [HttpPost("regerar")]
-    public async Task<IActionResult> RegerarPrompt([FromBody] RegerarRequest request)
+    public async Task<IActionResult> RegerarPrompt([FromBody] RegerarRequest request, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(request.PromptAtual))
-            return BadRequest(new { erro = "promptAtual � obrigat�rio." });
+            return BadRequest(new { erro = "promptAtual é obrigatório." });
         if (string.IsNullOrWhiteSpace(request.InstrucaoMelhora))
-            return BadRequest(new { erro = "instrucaoMelhora � obrigat�rio." });
+            return BadRequest(new { erro = "instrucaoMelhora é obrigatório." });
 
         var configError = ValidarConfiguracaoOpenRouter();
         if (configError is not null)
@@ -221,46 +218,54 @@ public class PromptController : ControllerBase
             var instrucao = tipo switch
             {
                 TipoObjetivo.Imagem or TipoObjetivo.Video =>
-                    $"Melhore este prompt de {tipo.ToString().ToLower()} aplicando: {request.InstrucaoMelhora}. Mantenha estilo t�cnico para {config.FerramentasAlvo}.",
+                    $"Melhore este prompt de {tipo.ToString().ToLowerInvariant()} aplicando: {request.InstrucaoMelhora}. Mantenha estilo técnico para {config.FerramentasAlvo}.",
                 TipoObjetivo.Codigo or TipoObjetivo.Refatoracao =>
-                    $"Refine este prompt t�cnico aplicando: {request.InstrucaoMelhora}. Mantenha especificidade e crit�rios mensur�veis.",
+                    $"Refine este prompt técnico aplicando: {request.InstrucaoMelhora}. Mantenha especificidade e critérios mensuráveis.",
                 TipoObjetivo.Copywriting =>
-                    $"Melhore este prompt de copywriting: {request.InstrucaoMelhora}. Mantenha foco em convers�o.",
+                    $"Melhore este prompt de copywriting: {request.InstrucaoMelhora}. Mantenha foco em conversão.",
                 _ => $"Aplique: {request.InstrucaoMelhora}"
             };
 
-            var (promptMelhorado, modeloUsado) = await ChamarOpenRouterComModelo(
-                modelo: MODELO_GERACAO, temperature: config.Temperature,
+            var melhoria = await ChamarCadeiaGeracao(
+                temperature: config.Temperature,
                 systemPrompt: $@"
-Voc� � um Arquiteto de Prompts especializado em {tipo}.
+Você é um Arquiteto de Prompts especializado em {tipo}.
 NUNCA descarte a estrutura existente.
-SEMPRE aplique a instru��o de melhora cirurgicamente.
-SEMPRE mantenha 95%+ de for�a para: {config.FerramentasAlvo}.",
+SEMPRE aplique a instrução de melhora cirurgicamente.
+SEMPRE mantenha 95%+ de força para: {config.FerramentasAlvo}.",
                 userPrompt: $@"
 Prompt atual:
 {request.PromptAtual}
 
-Instru��o: {instrucao}
+Instrução: {instrucao}
 Papel: {request.Papel ?? config.PapelPadrao}
 
 Retorne SOMENTE dentro das tags:
 <prompt_melhorado>
 [prompt completo melhorado]
-</prompt_melhorado>"
-            );
+</prompt_melhorado>",
+                cancellationToken: cancellationToken);
 
-            if (string.IsNullOrWhiteSpace(promptMelhorado))
-                return StatusCode(500, new { erro = "Gera��o do prompt melhorado falhou." });
+            if (!melhoria.Sucesso)
+            {
+                _logger.LogError("[RegerarPrompt] Geração do prompt melhorado falhou. Erro={Erro}", melhoria.Erro);
+                return FalhaUpstream("Geração do prompt melhorado", melhoria);
+            }
 
-            var validacao = await ValidarPorTipo(promptMelhorado, tipo, config);
-            string? final = ExtrairTagXmlRobusto(validacao ?? "", "prompt_final");
-            bool finalValido = final != null && final.Length > 80
-                && !final.StartsWith("Nenhum") && !final.StartsWith("Corrija");
+            var promptMelhorado = melhoria.Texto!;
+            var modeloUsado = melhoria.ModeloUsado ?? Modelos.Geracao;
+
+            var validacao = await ValidarPorTipo(promptMelhorado, tipo, config, cancellationToken);
+            var textoValidacao = validacao.Texto ?? "";
+
+            var final = ExtrairTagXmlRobusto(textoValidacao, "prompt_final");
+            var finalValido = final is not null
+                && final.Length > 80
+                && !final.StartsWith("Nenhum", StringComparison.OrdinalIgnoreCase)
+                && !final.StartsWith("Corrija", StringComparison.OrdinalIgnoreCase);
+
             if (!finalValido)
                 final = ExtrairTagXmlRobusto(promptMelhorado, "prompt_melhorado") ?? promptMelhorado;
-
-            string scoreRaw = ExtrairTagXmlRobusto(validacao ?? "", "score") ?? "N/A";
-            var    sm       = System.Text.RegularExpressions.Regex.Match(scoreRaw, @"\d+");
 
             return Ok(new
             {
@@ -269,104 +274,96 @@ Retorne SOMENTE dentro das tags:
                 prompt_otimizado = final!.Trim(),
                 pipeline = new
                 {
-                    etapa_1 = new { modelo = modeloUsado ?? MODELO_GERACAO, funcao = "Gera��o"   },
-                    etapa_2 = new { modelo = modeloUsado ?? MODELO_GERACAO, funcao = "Gera��o"   },
-                    etapa_3 = new { modelo = MODELO_VALIDACAO,              funcao = "Valida��o" },
-                    score_qualidade = sm.Success ? sm.Value : "N/A"
+                    etapa_1 = new { modelo = modeloUsado,      funcao = "Geração"   },
+                    etapa_2 = new { modelo = modeloUsado,      funcao = "Geração"   },
+                    etapa_3 = new { modelo = Modelos.Validacao, funcao = "Validação" },
+                    score_qualidade = ExtrairScore(textoValidacao)
                 }
             });
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("[RegerarPrompt] Requisição cancelada pelo cliente.");
+            return StatusCode(499);
+        }
         catch (Exception ex)
         {
-            Console.WriteLine($"[RegerarPrompt] Exception: {ex.Message}");
-            return StatusCode(500, new { erro = "Erro ao regerar", detalhes = ex.Message });
+            return ErroInterno(ex, nameof(RegerarPrompt));
         }
     }
 
     // ------------------------------------------------------------
-    // CLASSIFICA��O DE OBJETIVO
+    // CLASSIFICAÇÃO DE OBJETIVO
     // ------------------------------------------------------------
     private async Task<TipoObjetivo> ClassificarObjetivo(
-        string ideia, string contextoImagem, TipoObjetivo? tipoSugerido)
+        string ideia, TipoObjetivo? tipoSugerido, CancellationToken cancellationToken)
     {
-        var contextoExtra = string.IsNullOrEmpty(contextoImagem)
-            ? "" : $"\nContexto visual extra�do da imagem: {contextoImagem}";
-
-        var resultado = await ChamarOpenRouter(
-            modelo: MODELO_CLASSIFICADOR, temperature: 0.1,
+        var resposta = await ChamarModelo(
+            modelo: Modelos.Classificador, temperature: 0.1,
             systemPrompt: @"
-Voc� classifica o tipo de prompt que o usu�rio quer criar.
+Você classifica o tipo de prompt que o usuário quer criar.
 Tipos: Imagem, Video, Codigo, Refatoracao, Copywriting, DesignUI, Outro
 SEMPRE responda dentro das tags XML.",
             userPrompt: $@"
 Classifique:
-{(tipoSugerido.HasValue ? $"Usu�rio sugeriu: {tipoSugerido.Value}. Confirme ou corrija." : "Detecte automaticamente.")}
+{(tipoSugerido.HasValue ? $"Usuário sugeriu: {tipoSugerido.Value}. Confirme ou corrija." : "Detecte automaticamente.")}
 
-Pedido: '{ideia}'{contextoExtra}
+Pedido: '{ideia}'
 
 <classificacao>
   <tipo>Imagem/Video/Codigo/Refatoracao/Copywriting/DesignUI/Outro</tipo>
   <confianca>alta/media/baixa</confianca>
-</classificacao>"
-        );
+</classificacao>",
+            cancellationToken: cancellationToken);
 
-        var tipoStr = ExtrairTagXml(resultado ?? "", "tipo")?.Trim() ?? "";
-        if (string.IsNullOrEmpty(tipoStr) && tipoSugerido.HasValue)
-            return tipoSugerido.Value;
+        var tipoStr = ExtrairTagXml(resposta.Texto ?? "", "tipo")?.Trim() ?? "";
 
-        return tipoStr switch
-        {
-            "Imagem"      => TipoObjetivo.Imagem,
-            "Video"       => TipoObjetivo.Video,
-            "Codigo"      => TipoObjetivo.Codigo,
-            "Refatoracao" => TipoObjetivo.Refatoracao,
-            "Copywriting" => TipoObjetivo.Copywriting,
-            "DesignUI"    => TipoObjetivo.DesignUI,
-            _             => tipoSugerido ?? TipoObjetivo.Outro
-        };
+        // Os modelos gratuitos costumam responder com acento ou caixa diferente
+        // ("Código", "codigo", "VIDEO"), então a comparação é normalizada.
+        return TentarConverterTipo(tipoStr) ?? tipoSugerido ?? TipoObjetivo.Outro;
     }
 
     // ------------------------------------------------------------
-    // AN�LISE ESPECIALIZADA POR TIPO
+    // ANÁLISE ESPECIALIZADA POR TIPO
     // ------------------------------------------------------------
-    private async Task<string?> AnalisarPorTipo(
-        string ideia, TipoObjetivo tipo, string papel, ObjetivoConfig config)
+    private async Task<RespostaModelo> AnalisarPorTipo(
+        string ideia, TipoObjetivo tipo, string papel, ObjetivoConfig config, CancellationToken cancellationToken)
     {
         var campos = tipo switch
         {
             TipoObjetivo.Imagem => @"
-  <elementos_visuais>Sujeito, materiais, texturas, cores, ilumina��o, composi��o.</elementos_visuais>
-  <estilo_artistico>Refer�ncias visuais, movimento art�stico, artistas de refer�ncia.</estilo_artistico>
-  <parametros_tecnicos>Ferramenta alvo, resolu��o, aspect ratio, par�metros especiais.</parametros_tecnicos>
+  <elementos_visuais>Sujeito, materiais, texturas, cores, iluminação, composição.</elementos_visuais>
+  <estilo_artistico>Referências visuais, movimento artístico, artistas de referência.</estilo_artistico>
+  <parametros_tecnicos>Ferramenta alvo, resolução, aspect ratio, parâmetros especiais.</parametros_tecnicos>
   <o_que_evitar>Elementos que degradam ou conflitam com o objetivo.</o_que_evitar>",
 
             TipoObjetivo.Video => @"
-  <cena_principal>Ambiente, sujeitos, a��o central.</cena_principal>
-  <movimento_camera>Tipo de movimento, velocidade, transi��es.</movimento_camera>
-  <estilo_visual>Paleta, ilumina��o, atmosfera, refer�ncias.</estilo_visual>",
+  <cena_principal>Ambiente, sujeitos, ação central.</cena_principal>
+  <movimento_camera>Tipo de movimento, velocidade, transições.</movimento_camera>
+  <estilo_visual>Paleta, iluminação, atmosfera, referências.</estilo_visual>",
 
             TipoObjetivo.Copywriting => @"
-  <persona_alvo>Quem � o leitor, suas dores e desejos.</persona_alvo>
-  <proposta_valor>O que diferencia este produto/servi�o.</proposta_valor>
-  <gatilhos>Quais gatilhos usar (urg�ncia, prova social, autoridade).</gatilhos>
-  <tom_voz>Tom, linguagem, n�vel de formalidade.</tom_voz>",
+  <persona_alvo>Quem é o leitor, suas dores e desejos.</persona_alvo>
+  <proposta_valor>O que diferencia este produto/serviço.</proposta_valor>
+  <gatilhos>Quais gatilhos usar (urgência, prova social, autoridade).</gatilhos>
+  <tom_voz>Tom, linguagem, nível de formalidade.</tom_voz>",
 
             TipoObjetivo.DesignUI => @"
-  <componentes>Quais elementos de UI s�o necess�rios.</componentes>
-  <fluxo>Jornada e intera��es do usu�rio.</fluxo>
-  <tokens>Cores, tipografia, espa�amento necess�rios.</tokens>",
+  <componentes>Quais elementos de UI são necessários.</componentes>
+  <fluxo>Jornada e interações do usuário.</fluxo>
+  <tokens>Cores, tipografia, espaçamento necessários.</tokens>",
 
             _ => @"
   <objetivo_real>O que precisa ser implementado.</objetivo_real>
-  <armadilhas>3 erros que uma implementa��o ruim cometeria.</armadilhas>
-  <contexto_minimo>Stack, padr�es e requisitos m�nimos.</contexto_minimo>
-  <restricoes>5 restri��es NUNCA/SEMPRE espec�ficas.</restricoes>"
+  <armadilhas>3 erros que uma implementação ruim cometeria.</armadilhas>
+  <contexto_minimo>Stack, padrões e requisitos mínimos.</contexto_minimo>
+  <restricoes>5 restrições NUNCA/SEMPRE específicas.</restricoes>"
         };
 
-        return await ChamarOpenRouter(
-            modelo: MODELO_ANALISE, temperature: 0.3,
+        return await ChamarModelo(
+            modelo: Modelos.Analise, temperature: 0.3,
             systemPrompt: $@"
-Voc� � um analista de engenharia de prompts para {tipo}.
+Você é um analista de engenharia de prompts para {tipo}.
 Papel: {papel} | Ferramentas: {config.FerramentasAlvo}
 NUNCA gere o prompt final. Apenas analise.
 SEMPRE responda dentro das tags XML.",
@@ -377,32 +374,32 @@ Analise para {tipo} e responda SOMENTE neste XML:
 </analise>
 
 Papel: {papel}
-Pedido: {ideia}"
-        );
+Pedido: {ideia}",
+            cancellationToken: cancellationToken);
     }
 
     // ------------------------------------------------------------
-    // GERA��O ESPECIALIZADA POR TIPO
+    // GERAÇÃO ESPECIALIZADA POR TIPO
     // ------------------------------------------------------------
-    private async Task<(string? texto, string? modelo)> GerarPorTipo(
+    private async Task<RespostaModelo> GerarPorTipo(
         string ideia, TipoObjetivo tipo, string analise,
-        string papel, string formato, ObjetivoConfig config)
+        string papel, string formato, ObjetivoConfig config, CancellationToken cancellationToken)
     {
-        var criterios = string.Join("\n    ", config.CriteriosBase.Select((c, i) => $"{i+1}. {c}"));
+        var criterios = string.Join("\n    ", config.CriteriosBase.Select((c, i) => $"{i + 1}. {c}"));
 
-        // Imagem e v�deo: texto direto, sem XML
+        // Imagem e vídeo: texto direto, sem XML
         if (tipo is TipoObjetivo.Imagem or TipoObjetivo.Video)
         {
-            return await ChamarOpenRouterComModelo(
-                modelo: MODELO_GERACAO, temperature: config.Temperature,
+            return await ChamarCadeiaGeracao(
+                temperature: config.Temperature,
                 systemPrompt: $@"
-Voc� � especialista em prompt engineering para {tipo} ({config.FerramentasAlvo}).
+Você é especialista em prompt engineering para {tipo} ({config.FerramentasAlvo}).
 NUNCA use XML no prompt gerado.
-NUNCA adicione explica��es � apenas o prompt.
-SEMPRE inclua par�metros t�cnicos da ferramenta no final.
+NUNCA adicione explicações — apenas o prompt.
+SEMPRE inclua parâmetros técnicos da ferramenta no final.
 SEMPRE extraia 95%+ do potencial da IA geradora.",
                 userPrompt: $@"
-Com base na an�lise:
+Com base na análise:
 {analise}
 
 Crie o prompt para:
@@ -410,26 +407,26 @@ Crie o prompt para:
 - Ferramenta: {config.FerramentasAlvo}
 - Papel: {papel}
 
-Crit�rios obrigat�rios:
+Critérios obrigatórios:
 {criterios}
 
 Retorne SOMENTE dentro das tags:
 <prompt_gerado>
-[prompt completo � para Midjourney inclua --ar, --v, --style no final]
-</prompt_gerado>"
-            );
+[prompt completo — para Midjourney inclua --ar, --v, --style no final]
+</prompt_gerado>",
+                cancellationToken: cancellationToken);
         }
 
         // Outros: XML estruturado
-        return await ChamarOpenRouterComModelo(
-            modelo: MODELO_GERACAO, temperature: config.Temperature,
+        return await ChamarCadeiaGeracao(
+            temperature: config.Temperature,
             systemPrompt: $@"
-Voc� � um Arquiteto de Prompts S�nior para {tipo}.
+Você é um Arquiteto de Prompts Sênior para {tipo}.
 NUNCA adicione texto fora das tags XML.
-NUNCA seja gen�rico.
-SEMPRE inclua crit�rios mensur�veis.",
+NUNCA seja genérico.
+SEMPRE inclua critérios mensuráveis.",
             userPrompt: $@"
-Com base na an�lise:
+Com base na análise:
 {analise}
 
 Gere o prompt para:
@@ -438,61 +435,61 @@ Gere o prompt para:
 - Ferramenta: {config.FerramentasAlvo}
 - Formato: {formato}
 
-Crit�rios obrigat�rios:
+Critérios obrigatórios:
 {criterios}
 
 Retorne SOMENTE neste XML:
 <prompt_otimizado>
   <system_instruction>{papel}. Ferramenta: {config.FerramentasAlvo}.</system_instruction>
-  <restricoes_constitucionais>6 restri��es NUNCA/SEMPRE espec�ficas para {tipo}.</restricoes_constitucionais>
-  <instrucao_principal>Tarefa �nica com crit�rio de sucesso mensur�vel.</instrucao_principal>
+  <restricoes_constitucionais>6 restrições NUNCA/SEMPRE específicas para {tipo}.</restricoes_constitucionais>
+  <instrucao_principal>Tarefa única com critério de sucesso mensurável.</instrucao_principal>
   <criterios_de_aceitacao>{criterios}</criterios_de_aceitacao>
-  <few_shot_exemplo>INPUT: exemplo realista | REASONING: racioc�nio | OUTPUT: resultado correto</few_shot_exemplo>
+  <few_shot_exemplo>INPUT: exemplo realista | REASONING: raciocínio | OUTPUT: resultado correto</few_shot_exemplo>
   <formato_resposta>{formato}</formato_resposta>
-  <loop_validacao>Verifique os {config.CriteriosBase.Length} crit�rios antes de entregar.</loop_validacao>
-</prompt_otimizado>"
-        );
+  <loop_validacao>Verifique os {config.CriteriosBase.Length} critérios antes de entregar.</loop_validacao>
+</prompt_otimizado>",
+            cancellationToken: cancellationToken);
     }
 
     // ------------------------------------------------------------
-    // VALIDA��O ESPECIALIZADA POR TIPO
+    // VALIDAÇÃO ESPECIALIZADA POR TIPO
     // ------------------------------------------------------------
-    private async Task<string?> ValidarPorTipo(
-        string promptGerado, TipoObjetivo tipo, ObjetivoConfig config)
+    private async Task<RespostaModelo> ValidarPorTipo(
+        string promptGerado, TipoObjetivo tipo, ObjetivoConfig config, CancellationToken cancellationToken)
     {
         var checklist = tipo switch
         {
             TipoObjetivo.Imagem => @"
-    Sujeito principal descrito com precis�o visual: sim/n�o
-    Estilo art�stico e refer�ncias especificados: sim/n�o
-    Ilumina��o e composi��o inclu�dos: sim/n�o
-    Par�metros t�cnicos da ferramenta presentes: sim/n�o
-    Tom e atmosfera claros: sim/n�o",
+    Sujeito principal descrito com precisão visual: sim/não
+    Estilo artístico e referências especificados: sim/não
+    Iluminação e composição incluídos: sim/não
+    Parâmetros técnicos da ferramenta presentes: sim/não
+    Tom e atmosfera claros: sim/não",
 
             TipoObjetivo.Video => @"
-    Sujeito e a��o principal claros: sim/n�o
-    Movimento de c�mera especificado: sim/n�o
-    Atmosfera e ilumina��o descritos: sim/n�o
-    Estilo visual de refer�ncia presente: sim/n�o",
+    Sujeito e ação principal claros: sim/não
+    Movimento de câmera especificado: sim/não
+    Atmosfera e iluminação descritos: sim/não
+    Estilo visual de referência presente: sim/não",
 
             TipoObjetivo.Copywriting => @"
-    Persona-alvo claramente definida: sim/n�o
-    Proposta de valor �nica presente: sim/n�o
-    Gatilhos psicol�gicos espec�ficos: sim/n�o
-    CTA claro e orientado � a��o: sim/n�o",
+    Persona-alvo claramente definida: sim/não
+    Proposta de valor única presente: sim/não
+    Gatilhos psicológicos específicos: sim/não
+    CTA claro e orientado à ação: sim/não",
 
             _ => @"
-    Papel t�cnico ultra-espec�fico com stack: sim/n�o
-    Crit�rios de aceita��o test�veis: sim/n�o
-    Exemplo few-shot t�cnico e realista: sim/n�o
-    Aus�ncia de linguagem vaga: sim/n�o"
+    Papel técnico ultra-específico com stack: sim/não
+    Critérios de aceitação testáveis: sim/não
+    Exemplo few-shot técnico e realista: sim/não
+    Ausência de linguagem vaga: sim/não"
         };
 
-        return await ChamarOpenRouter(
-            modelo: MODELO_VALIDACAO, temperature: 0.1,
+        return await ChamarModelo(
+            modelo: Modelos.Validacao, temperature: 0.1,
             systemPrompt: $@"
-Voc� valida prompts para {tipo} ({config.FerramentasAlvo}).
-Prompts ricos e detalhados s�o CORRETOS � n�o penalize detalhamento.
+Você valida prompts para {tipo} ({config.FerramentasAlvo}).
+Prompts ricos e detalhados são CORRETOS — não penalize detalhamento.
 Penalize apenas genericidade e falta de especificidade.
 SEMPRE responda dentro das tags XML.",
             userPrompt: $@"
@@ -500,78 +497,97 @@ Valide este prompt para {tipo}:
 
 <validacao>
   <checklist>{checklist}</checklist>
-  <problemas_encontrados>Problemas reais. Se nenhum: Nenhum problema cr�tico encontrado.</problemas_encontrados>
-  <prompt_final>Corrija problemas reais. Se tudo ok: copie sem altera��es.</prompt_final>
-  <score>0-100. Prompts ricos e espec�ficos devem pontuar 85+.</score>
+  <problemas_encontrados>Problemas reais. Se nenhum: Nenhum problema crítico encontrado.</problemas_encontrados>
+  <prompt_final>Corrija problemas reais. Se tudo ok: copie sem alterações.</prompt_final>
+  <score>0-100. Prompts ricos e específicos devem pontuar 85+.</score>
 </validacao>
 
 Prompt:
-{promptGerado}"
-        );
+{promptGerado}",
+            cancellationToken: cancellationToken);
     }
 
     // ------------------------------------------------------------
-    // DETEC��O DE AMBIGUIDADE
+    // DETECÇÃO DE AMBIGUIDADE
     // ------------------------------------------------------------
     private async Task<List<PerguntaClarificacao>> DetectarAmbiguidade(
-        string ideiaBruta, TipoObjetivo tipo)
+        string ideiaBruta, TipoObjetivo tipo, CancellationToken cancellationToken)
     {
         var exemplos = tipo switch
         {
-            TipoObjetivo.Imagem => "- 'personagem' ? original ou IP existente?\n- 'estilo anime' ? qual subg�nero?\n- 'fundo' ? transparente ou cen�rio elaborado?",
-            TipoObjetivo.Video  => "- 'anima��o' ? 2D, 3D ou stop motion?\n- 'c�mera' ? movimento espec�fico ou est�tica?",
-            TipoObjetivo.Codigo => "- 'canva' ? site Canva.com ou HTML Canvas API?\n- 'mobile' ? React Native, Flutter ou nativo?\n- 'banco' ? qual SGBD?",
-            _ => "- Termos com m�ltiplos significados t�cnicos\n- Refer�ncias amb�guas a ferramentas"
+            TipoObjetivo.Imagem => "- 'personagem' → original ou IP existente?\n- 'estilo anime' → qual subgênero?\n- 'fundo' → transparente ou cenário elaborado?",
+            TipoObjetivo.Video  => "- 'animação' → 2D, 3D ou stop motion?\n- 'câmera' → movimento específico ou estática?",
+            TipoObjetivo.Codigo => "- 'canva' → site Canva.com ou HTML Canvas API?\n- 'mobile' → React Native, Flutter ou nativo?\n- 'banco' → qual SGBD?",
+            _ => "- Termos com múltiplos significados técnicos\n- Referências ambíguas a ferramentas"
         };
 
-        var resultado = await ChamarOpenRouter(
-            modelo: MODELO_AMBIGUIDADE, temperature: 0.2,
+        var resposta = await ChamarModelo(
+            modelo: Modelos.Ambiguidade, temperature: 0.2,
             systemPrompt: $@"
-Voc� detecta ambiguidades cr�ticas em pedidos para {tipo}.
+Você detecta ambiguidades críticas em pedidos para {tipo}.
 Exemplos relevantes: {exemplos}
 NUNCA gere mais de 2 perguntas.
-SEMPRE gere op��es clic�veis.
+SEMPRE gere opções clicáveis.
 SEMPRE responda em XML.",
             userPrompt: $@"
 Detecte ambiguidades em: '{ideiaBruta}'
 
 <resultado>
-  <tem_ambiguidade>sim/n�o</tem_ambiguidade>
+  <tem_ambiguidade>sim/não</tem_ambiguidade>
   <perguntas>
-    <pergunta><id>id_unico</id><texto>Pergunta direta</texto><opcoes>A | B | C</opcoes><livre>sim/n�o</livre></pergunta>
+    <pergunta><id>id_unico</id><texto>Pergunta direta</texto><opcoes>A | B | C</opcoes><livre>sim/não</livre></pergunta>
   </perguntas>
-</resultado>"
-        );
+</resultado>",
+            cancellationToken: cancellationToken);
 
-        var temAmbiguidade = ExtrairTagXml(resultado ?? "", "tem_ambiguidade")?.Trim().ToLower();
+        var texto = resposta.Texto ?? "";
+        var temAmbiguidade = ExtrairTagXml(texto, "tem_ambiguidade")?.Trim().ToLowerInvariant();
         if (temAmbiguidade != "sim") return new List<PerguntaClarificacao>();
 
+        return ExtrairPerguntas(texto);
+    }
+
+    /// <summary>
+    /// Percorre os blocos &lt;pergunta&gt; da resposta. A busca pelo fechamento parte
+    /// da abertura correspondente — antes ambos os índices partiam da mesma posição,
+    /// o que podia produzir um intervalo invertido e derrubar a requisição.
+    /// </summary>
+    internal static List<PerguntaClarificacao> ExtrairPerguntas(string texto)
+    {
+        const string abertura = "<pergunta>";
+        const string fechamento = "</pergunta>";
+
         var perguntas = new List<PerguntaClarificacao>();
-        var texto = resultado ?? "";
-        int pos = 0;
+        var pos = 0;
 
-        while (perguntas.Count < 2)
+        while (perguntas.Count < 2 && pos < texto.Length)
         {
-            int inicio = texto.IndexOf("<pergunta>", pos);
-            int fim    = texto.IndexOf("</pergunta>", pos);
-            if (inicio < 0 || fim < 0) break;
+            var inicio = texto.IndexOf(abertura, pos, StringComparison.Ordinal);
+            if (inicio < 0) break;
 
-            var bloco = texto[(inicio + "<pergunta>".Length)..fim];
-            var id    = ExtrairTagXml(bloco, "id")?.Trim()     ?? $"q{perguntas.Count}";
-            var txt   = ExtrairTagXml(bloco, "texto")?.Trim()  ?? "";
-            var opts  = ExtrairTagXml(bloco, "opcoes")?.Trim() ?? "";
-            var livre = ExtrairTagXml(bloco, "livre")?.Trim().ToLower() == "sim";
+            var conteudoInicio = inicio + abertura.Length;
+            var fim = texto.IndexOf(fechamento, conteudoInicio, StringComparison.Ordinal);
+            if (fim < 0) break;
+
+            var bloco = texto[conteudoInicio..fim];
+            var txt = ExtrairTagXml(bloco, "texto")?.Trim() ?? "";
 
             if (!string.IsNullOrWhiteSpace(txt))
-                perguntas.Add(new PerguntaClarificacao {
-                    Id     = id,
-                    Texto  = txt,
-                    Opcoes = opts.Split('|', StringSplitOptions.RemoveEmptyEntries)
-                                 .Select(o => o.Trim()).Where(o => !string.IsNullOrEmpty(o)).ToList(),
-                    Livre  = livre
+            {
+                var opcoes = ExtrairTagXml(bloco, "opcoes")?.Trim() ?? "";
+                perguntas.Add(new PerguntaClarificacao
+                {
+                    Id    = ExtrairTagXml(bloco, "id")?.Trim() is { Length: > 0 } id ? id : $"q{perguntas.Count}",
+                    Texto = txt,
+                    Opcoes = opcoes.Split('|', StringSplitOptions.RemoveEmptyEntries)
+                                   .Select(o => o.Trim())
+                                   .Where(o => o.Length > 0)
+                                   .ToList(),
+                    Livre = string.Equals(ExtrairTagXml(bloco, "livre")?.Trim(), "sim", StringComparison.OrdinalIgnoreCase)
                 });
+            }
 
-            pos = fim + "</pergunta>".Length;
+            pos = fim + fechamento.Length;
         }
 
         return perguntas;
@@ -581,152 +597,209 @@ Detecte ambiguidades em: '{ideiaBruta}'
     // TRIAGEM DE COMPLEXIDADE
     // ------------------------------------------------------------
     private async Task<(bool isComplexo, string aviso, List<SubTarefaItem> subTarefas, string recomendacao)>
-        TriarComplexidade(string ideia)
+        TriarComplexidade(string ideia, CancellationToken cancellationToken)
     {
-        var resultado = await ChamarOpenRouter(
-            modelo: MODELO_TRIAGEM, temperature: 0.1,
+        var resposta = await ChamarModelo(
+            modelo: Modelos.Triagem, temperature: 0.1,
             systemPrompt: @"
-Voc� decide se um pedido de software REALMENTE precisa ser dividido em m�ltiplas tarefas independentes.
+Você decide se um pedido de software REALMENTE precisa ser dividido em múltiplas tarefas independentes.
 
 REGRAS RIGOROSAS:
-- Classifique como SIMPLES se: � uma �nica funcionalidade, refatora��o de c�digo existente, aplicar um padr�o/estilo, adicionar uma feature, corrigir bugs, criar um componente.
-- Classifique como COMPLEXO APENAS se: s�o claramente sistemas separados (ex: backend + frontend + banco + deploy), ou o usu�rio explicitamente pediu uma lista de tarefas.
-- NUNCA divida por se��es de uma mesma p�gina � isso � simples.
-- NUNCA divida refatora��es � aplicar um padr�o a c�digo existente � SEMPRE simples.
-- NUNCA divida por componentes de UI � criar v�rios componentes � uma tarefa �nica.
-- Em caso de d�vida: classifique como SIMPLES.
-- M�ximo 4 sub-tarefas se realmente complexo.",
+- Classifique como SIMPLES se: é uma única funcionalidade, refatoração de código existente, aplicar um padrão/estilo, adicionar uma feature, corrigir bugs, criar um componente.
+- Classifique como COMPLEXO APENAS se: são claramente sistemas separados (ex: backend + frontend + banco + deploy), ou o usuário explicitamente pediu uma lista de tarefas.
+- NUNCA divida por seções de uma mesma página — isso é simples.
+- NUNCA divida refatorações — aplicar um padrão a código existente é SEMPRE simples.
+- NUNCA divida por componentes de UI — criar vários componentes é uma tarefa única.
+- Em caso de dúvida: classifique como SIMPLES.
+- Máximo 4 sub-tarefas se realmente complexo.",
             userPrompt: $@"
 Pedido: '{ideia}'
 
 <triagem>
   <classificacao>simples/complexo</classificacao>
-  <justificativa>Uma frase explicando POR QUE � complexo (ou deixe vazio se simples).</justificativa>
-  <sub_tarefas>TITULO | DESCRICAO | COMPLEXIDADE � uma por linha. Deixe VAZIO se simples.</sub_tarefas>
+  <justificativa>Uma frase explicando POR QUE é complexo (ou deixe vazio se simples).</justificativa>
+  <sub_tarefas>TITULO | DESCRICAO | COMPLEXIDADE — uma por linha. Deixe VAZIO se simples.</sub_tarefas>
   <recomendacao>Qual implementar primeiro. Vazio se simples.</recomendacao>
-</triagem>"
-        );
+</triagem>",
+            cancellationToken: cancellationToken);
 
-        var classificacao = ExtrairTagXml(resultado ?? "", "classificacao")?.Trim().ToLower();
-        if (classificacao != "complexo") return (false, "", new List<SubTarefaItem>(), "");
+        var texto = resposta.Texto ?? "";
+        var classificacao = ExtrairTagXml(texto, "classificacao")?.Trim().ToLowerInvariant();
+        if (classificacao != "complexo")
+            return (false, "", new List<SubTarefaItem>(), "");
 
-        var aviso        = ExtrairTagXml(resultado ?? "", "justificativa")?.Trim() ?? "";
-        var recomendacao = ExtrairTagXml(resultado ?? "", "recomendacao")?.Trim()  ?? "";
-        var rawTarefas   = ExtrairTagXml(resultado ?? "", "sub_tarefas")?.Trim()   ?? "";
+        var aviso        = ExtrairTagXml(texto, "justificativa")?.Trim() ?? "";
+        var recomendacao = ExtrairTagXml(texto, "recomendacao")?.Trim()  ?? "";
+        var subTarefas   = ExtrairSubTarefas(ExtrairTagXml(texto, "sub_tarefas")?.Trim() ?? "");
 
-        var subTarefas = rawTarefas
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(l => l.Trim().TrimStart('-', '*', ' '))
-            .Where(l => !string.IsNullOrWhiteSpace(l))
-            .Select(l => { var p = l.Split('|'); return new SubTarefaItem {
-                Titulo = p.Length > 0 ? p[0].Trim() : l,
-                Descricao = p.Length > 1 ? p[1].Trim() : "",
-                Complexidade = p.Length > 2 ? p[2].Trim().ToLower() : "media"
-            }; }).Take(8).ToList();
+        // Sem sub-tarefas utilizáveis o "plano de divisão" seria uma tela vazia:
+        // nesse caso seguimos o fluxo simples.
+        if (subTarefas.Count == 0)
+            return (false, "", subTarefas, "");
 
         return (true, aviso, subTarefas, recomendacao);
     }
 
+    internal static List<SubTarefaItem> ExtrairSubTarefas(string raw) =>
+        raw.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+           .Select(l => l.Trim().TrimStart('-', '*', ' '))
+           .Where(l => !string.IsNullOrWhiteSpace(l))
+           .Select(l =>
+           {
+               var p = l.Split('|');
+               return new SubTarefaItem
+               {
+                   Titulo       = p[0].Trim(),
+                   Descricao    = p.Length > 1 ? p[1].Trim() : "",
+                   Complexidade = p.Length > 2 ? NormalizarComplexidade(p[2]) : "media"
+               };
+           })
+           .Where(t => !string.IsNullOrWhiteSpace(t.Titulo))
+           .Take(8)
+           .ToList();
+
+    /// <summary>
+    /// O frontend só sabe renderizar "baixa" | "media" | "alta"; qualquer outra
+    /// coisa vinda do modelo vira "media".
+    /// </summary>
+    private static string NormalizarComplexidade(string valor)
+    {
+        var normalizado = RemoverAcentos(valor.Trim()).ToLowerInvariant();
+        return normalizado switch
+        {
+            "baixa" or "low"  => "baixa",
+            "alta"  or "high" => "alta",
+            _                 => "media"
+        };
+    }
+
     // ------------------------------------------------------------
-    // DETEC��O PAPEL + FORMATO
+    // DETECÇÃO PAPEL + FORMATO
     // ------------------------------------------------------------
     private async Task<(string papel, string formato)> DetectarPapelEFormato(
-        string ideia, string? papelUsuario, ObjetivoConfig config)
+        string ideia, string? papelUsuario, ObjetivoConfig config, CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(papelUsuario))
             return (papelUsuario.Trim(), config.FormatoPadrao);
 
-        var resultado = await ChamarOpenRouter(
-            modelo: MODELO_DETECCAO, temperature: 0.2,
+        var resposta = await ChamarModelo(
+            modelo: Modelos.Deteccao, temperature: 0.2,
             systemPrompt: $@"
-Identifique o papel t�cnico ideal. Padr�o: '{config.PapelPadrao}'.
-NUNCA seja gen�rico. SEMPRE inclua stack espec�fica.
+Identifique o papel técnico ideal. Padrão: '{config.PapelPadrao}'.
+NUNCA seja genérico. SEMPRE inclua stack específica.
 SEMPRE responda em XML.",
             userPrompt: $@"
 <deteccao>
-  <papel>Papel t�cnico ultra-espec�fico com stack.</papel>
+  <papel>Papel técnico ultra-específico com stack.</papel>
   <formato>{config.FormatoPadrao}</formato>
 </deteccao>
-Tarefa: '{ideia}'"
-        );
+Tarefa: '{ideia}'",
+            cancellationToken: cancellationToken);
 
-        var papel   = ExtrairTagXml(resultado ?? "", "papel")?.Trim()   ?? config.PapelPadrao;
-        var formato = ExtrairTagXml(resultado ?? "", "formato")?.Trim() ?? config.FormatoPadrao;
-        return (papel, formato);
+        var texto   = resposta.Texto ?? "";
+        var papel   = ExtrairTagXml(texto, "papel")?.Trim();
+        var formato = ExtrairTagXml(texto, "formato")?.Trim();
+
+        return (
+            string.IsNullOrWhiteSpace(papel)   ? config.PapelPadrao   : papel,
+            string.IsNullOrWhiteSpace(formato) ? config.FormatoPadrao : formato);
     }
 
     // ------------------------------------------------------------
     // HELPERS
     // ------------------------------------------------------------
-    private static string MontarIdeiaEnriquecida(
-        string ideia, string contextoImagem, Dictionary<string, string>? respostas,
-        string? executor = null)
+    internal static string MontarIdeiaEnriquecida(
+        string ideia, Dictionary<string, string>? respostas, string? executor = null)
     {
         var sb = new StringBuilder(ideia);
-        if (!string.IsNullOrEmpty(contextoImagem))
-            sb.Append($"\n\n[AN�LISE VISUAL DA IMAGEM DE REFER�NCIA:\n{contextoImagem}]");
-        if (!string.IsNullOrEmpty(executor))
-            sb.Append($"\n\n[EXECUTOR DO PROMPT: {executor} � otimize a estrutura, verbosidade e formato do prompt especificamente para este assistente de c�digo.]");
+
+        if (!string.IsNullOrWhiteSpace(executor))
+            sb.Append($"\n\n[EXECUTOR DO PROMPT: {executor} — otimize a estrutura, verbosidade e formato do prompt especificamente para este assistente de código.]");
+
         if (respostas?.Count > 0)
         {
-            sb.Append("\n\n[CONTEXTO ADICIONAL DO USU�RIO:");
+            sb.Append("\n\n[CONTEXTO ADICIONAL DO USUÁRIO:");
             foreach (var (id, resp) in respostas)
                 sb.Append($"\n- {id}: {resp}");
-            sb.Append("]");
+            sb.Append(']');
         }
+
         return sb.ToString();
     }
 
-    private async Task<string?> ChamarOpenRouter(
-        string modelo, double temperature, string systemPrompt, string userPrompt)
-    {
-        var (texto, _) = await ChamarOpenRouterComModelo(modelo, temperature, systemPrompt, userPrompt);
-        return texto;
-    }
+    /// <summary>Chama um único modelo, sem cadeia de fallback.</summary>
+    private Task<RespostaModelo> ChamarModelo(
+        string modelo, double temperature, string systemPrompt, string userPrompt,
+        CancellationToken cancellationToken) =>
+        ChamarComFallback(new[] { modelo }, temperature, systemPrompt, userPrompt, cancellationToken);
 
-    private async Task<(string? texto, string? modeloUsado)> ChamarOpenRouterComModelo(
-        string modelo, double temperature, string systemPrompt, string userPrompt)
-    {
-        // Se modelo � o principal de gera��o, usa fallback autom�tico
-        var modelos = modelo == MODELOS_GERACAO_FALLBACK[0]
-            ? MODELOS_GERACAO_FALLBACK
-            : new[] { modelo };
+    /// <summary>
+    /// Chama a cadeia de geração, caindo para o próximo modelo quando o anterior
+    /// falha ou devolve vazio. Antes a cadeia era escolhida comparando o id do
+    /// modelo com o primeiro item da lista, o que ligava o fallback por acidente
+    /// a qualquer etapa que usasse o mesmo id.
+    /// </summary>
+    private Task<RespostaModelo> ChamarCadeiaGeracao(
+        double temperature, string systemPrompt, string userPrompt,
+        CancellationToken cancellationToken) =>
+        ChamarComFallback(Modelos.GeracaoFallback, temperature, systemPrompt, userPrompt, cancellationToken);
 
-        foreach (var m in modelos)
+    private async Task<RespostaModelo> ChamarComFallback(
+        IReadOnlyList<string> modelos, double temperature, string systemPrompt, string userPrompt,
+        CancellationToken cancellationToken)
+    {
+        string? ultimoErro = null;
+        HttpStatusCode? ultimoStatus = null;
+
+        foreach (var modelo in modelos)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             try
             {
-                var (texto, modeloUsado) = await ChamarModeloSingle(m, temperature, systemPrompt, userPrompt);
+                var (texto, modeloUsado) = await ChamarModeloSingle(modelo, temperature, systemPrompt, userPrompt, cancellationToken);
                 if (!string.IsNullOrWhiteSpace(texto))
-                    return (texto, modeloUsado);
-                Console.WriteLine($"[Fallback] Modelo {m} retornou vazio, tentando pr�ximo...");
+                    return RespostaModelo.Ok(texto, modeloUsado ?? modelo);
+
+                ultimoErro = $"O modelo {modelo} respondeu vazio.";
+                _logger.LogWarning("[Fallback] Modelo {Modelo} retornou vazio, tentando próximo...", modelo);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // Estouro do timeout individual da chamada.
+                ultimoErro = $"O modelo {modelo} excedeu {_options.TimeoutSeconds}s.";
+                _logger.LogWarning("[Fallback] Timeout no modelo {Modelo}, tentando próximo...", modelo);
+            }
+            catch (HttpRequestException ex)
+            {
+                ultimoStatus = ex.StatusCode;
+                ultimoErro = PrimeiraLinha(ex.Message);
+                _logger.LogWarning(ex, "[Fallback] Modelo {Modelo} falhou ({Status}), tentando próximo...", modelo, ex.StatusCode);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Fallback] Modelo {m} falhou: {ex.GetType().Name} � {ex.Message.Split('\n')[0]}. Tentando pr�ximo...");
+                ultimoErro = PrimeiraLinha(ex.Message);
+                _logger.LogWarning(ex, "[Fallback] Modelo {Modelo} falhou, tentando próximo...", modelo);
             }
         }
-        Console.WriteLine("[Fallback] Todos os modelos falharam.");
-        return (null, null);
-    }
 
-    private ObjectResult? ValidarConfiguracaoOpenRouter()
-    {
-        if (!string.IsNullOrWhiteSpace(_openRouterApiKey))
-            return null;
-
-        return StatusCode(StatusCodes.Status503ServiceUnavailable, new
-        {
-            erro = OpenRouterApiKeyMissingMessage
-        });
+        _logger.LogError("[Fallback] Todos os modelos falharam. Último erro: {Erro}", ultimoErro);
+        return RespostaModelo.Falha(ultimoErro ?? "Nenhum modelo respondeu.", ultimoStatus);
     }
 
     private async Task<(string? texto, string? modeloUsado)> ChamarModeloSingle(
-        string modelo, double temperature, string systemPrompt, string userPrompt)
+        string modelo, double temperature, string systemPrompt, string userPrompt,
+        CancellationToken cancellationToken)
     {
         var payload = new
         {
-            model = modelo, temperature, max_tokens = 2048,
+            model = modelo,
+            temperature,
+            max_tokens = _options.MaxTokens,
             messages = new[]
             {
                 new { role = "system", content = systemPrompt.Trim() },
@@ -734,35 +807,173 @@ Tarefa: '{ideia}'"
             }
         };
 
-        var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-        using var req = new HttpRequestMessage(HttpMethod.Post, OPENROUTER_URL);
-        req.Headers.Add("Authorization", $"Bearer {_openRouterApiKey!}");
-        req.Headers.Add("HTTP-Referer",  "https://apiassistente.local");
-        req.Headers.Add("X-Title",       "ApiAssistente - Prompt Engineer");
-        req.Content = content;
+        using var req = new HttpRequestMessage(HttpMethod.Post, _options.BaseUrl);
+        req.Headers.Add("Authorization", $"Bearer {_options.ApiKey}");
+        req.Headers.Add("HTTP-Referer", _options.Referer);
+        req.Headers.Add("X-Title", _options.Title);
+        req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
-        // Timeout individual por chamada � evita o TaskCanceledException do cliente global
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
-        var res  = await _httpClient.SendAsync(req, cts.Token);
+        // Timeout individual por chamada, encadeado ao cancelamento da requisição:
+        // se o cliente desiste, paramos de gastar chamadas ao OpenRouter.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(_options.TimeoutSeconds));
+
+        using var res = await _httpClient.SendAsync(req, cts.Token);
         res.EnsureSuccessStatusCode();
-        var json = await res.Content.ReadAsStringAsync();
+
+        var json = await res.Content.ReadAsStringAsync(cts.Token);
         var node = JsonNode.Parse(json);
+
         return (node?["choices"]?[0]?["message"]?["content"]?.ToString(), node?["model"]?.ToString());
     }
 
-    private static string? ExtrairTagXml(string texto, string tag)
+    private ObjectResult? ValidarConfiguracaoOpenRouter()
     {
-        var a = $"<{tag}>"; var f = $"</{tag}>";
-        int i = texto.IndexOf(a), j = texto.IndexOf(f);
-        if (i < 0 || j < 0) return null;
-        return texto[(i + a.Length)..j].Trim();
+        if (_options.TemApiKey)
+            return null;
+
+        return StatusCode(StatusCodes.Status503ServiceUnavailable, new
+        {
+            erro = OpenRouterOptions.ApiKeyMissingMessage
+        });
     }
 
-    private static string? ExtrairTagXmlRobusto(string texto, string tag)
+    /// <summary>
+    /// Falha vinda do provedor externo. Vira 429 quando é limite de uso e 502 no
+    /// resto — antes qualquer falha do OpenRouter virava um 500 genérico de
+    /// "resposta vazia", escondendo a causa real (chave inválida, modelo removido,
+    /// rate limit).
+    /// </summary>
+    private ObjectResult FalhaUpstream(string etapa, RespostaModelo resposta)
     {
-        var abertura = $"<{tag}>"; var fechamento = $"</{tag}>";
-        int inicio = texto.IndexOf(abertura), fim = texto.LastIndexOf(fechamento);
-        if (inicio < 0 || fim < 0 || fim <= inicio) return null;
-        return texto[(inicio + abertura.Length)..fim].Trim();
+        var status = resposta.StatusUpstream == HttpStatusCode.TooManyRequests
+            ? StatusCodes.Status429TooManyRequests
+            : StatusCodes.Status502BadGateway;
+
+        return StatusCode(status, new
+        {
+            erro = $"{etapa} falhou: nenhum modelo do OpenRouter respondeu.",
+            detalhes = Truncar(resposta.Erro ?? "", 300)
+        });
+    }
+
+    /// <summary>
+    /// Erros inesperados são registrados no log e devolvidos sem a mensagem da
+    /// exceção, que pode carregar detalhes internos. O trace id permite achar a
+    /// entrada correspondente no log.
+    /// </summary>
+    private ObjectResult ErroInterno(Exception ex, string operacao)
+    {
+        _logger.LogError(ex, "[{Operacao}] Erro inesperado. TraceId={TraceId}", operacao, HttpContext.TraceIdentifier);
+
+        return StatusCode(StatusCodes.Status500InternalServerError, new
+        {
+            erro = "Erro interno ao processar o pedido.",
+            trace_id = HttpContext.TraceIdentifier
+        });
+    }
+
+    private static string ExtrairScore(string validacao)
+    {
+        var scoreRaw = ExtrairTagXmlRobusto(validacao, "score");
+        if (string.IsNullOrWhiteSpace(scoreRaw)) return "N/A";
+
+        var match = Regex.Match(scoreRaw, @"\d+");
+        if (!match.Success) return "N/A";
+
+        return int.TryParse(match.Value, out var valor)
+            ? Math.Clamp(valor, 0, 100).ToString(CultureInfo.InvariantCulture)
+            : "N/A";
+    }
+
+    private static readonly Dictionary<string, TipoObjetivo> TiposPorNome =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["imagem"]      = TipoObjetivo.Imagem,
+            ["image"]       = TipoObjetivo.Imagem,
+            ["video"]       = TipoObjetivo.Video,
+            ["codigo"]      = TipoObjetivo.Codigo,
+            ["code"]        = TipoObjetivo.Codigo,
+            ["refatoracao"] = TipoObjetivo.Refatoracao,
+            ["refactor"]    = TipoObjetivo.Refatoracao,
+            ["copywriting"] = TipoObjetivo.Copywriting,
+            ["copy"]        = TipoObjetivo.Copywriting,
+            ["designui"]    = TipoObjetivo.DesignUI,
+            ["design"]      = TipoObjetivo.DesignUI,
+            ["ui"]          = TipoObjetivo.DesignUI,
+            ["uiux"]        = TipoObjetivo.DesignUI,
+            ["outro"]       = TipoObjetivo.Outro,
+        };
+
+    internal static TipoObjetivo? TentarConverterTipo(string? valor)
+    {
+        if (string.IsNullOrWhiteSpace(valor)) return null;
+
+        var chave = RemoverAcentos(valor.Trim()).Replace("/", "").Replace("-", "").Replace(" ", "");
+        return TiposPorNome.TryGetValue(chave, out var tipo) ? tipo : null;
+    }
+
+    private static string RemoverAcentos(string texto) =>
+        new(texto.Normalize(NormalizationForm.FormD)
+                 .Where(c => CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+                 .ToArray());
+
+    private static string PrimeiraLinha(string texto) =>
+        texto.Split('\n', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? texto;
+
+    private static string Truncar(string texto, int max) =>
+        texto.Length <= max ? texto : texto[..max];
+
+    /// <summary>
+    /// Extrai o conteúdo do primeiro par &lt;tag&gt;...&lt;/tag&gt;. O fechamento é
+    /// procurado a partir da abertura: buscar os dois índices do início do texto
+    /// permitia um intervalo invertido e um ArgumentOutOfRangeException sempre que
+    /// o modelo ecoava a tag de fechamento antes da de abertura.
+    /// </summary>
+    internal static string? ExtrairTagXml(string texto, string tag)
+    {
+        var abertura = $"<{tag}>";
+        var fechamento = $"</{tag}>";
+
+        var inicio = texto.IndexOf(abertura, StringComparison.Ordinal);
+        if (inicio < 0) return null;
+
+        var conteudoInicio = inicio + abertura.Length;
+        var fim = texto.IndexOf(fechamento, conteudoInicio, StringComparison.Ordinal);
+        if (fim < 0) return null;
+
+        return texto[conteudoInicio..fim].Trim();
+    }
+
+    /// <summary>
+    /// Variante que casa a abertura com o ÚLTIMO fechamento, para blocos que contêm
+    /// tags aninhadas de mesmo nome.
+    /// </summary>
+    internal static string? ExtrairTagXmlRobusto(string texto, string tag)
+    {
+        var abertura = $"<{tag}>";
+        var fechamento = $"</{tag}>";
+
+        var inicio = texto.IndexOf(abertura, StringComparison.Ordinal);
+        if (inicio < 0) return null;
+
+        var conteudoInicio = inicio + abertura.Length;
+        var fim = texto.LastIndexOf(fechamento, StringComparison.Ordinal);
+        if (fim < conteudoInicio) return null;
+
+        return texto[conteudoInicio..fim].Trim();
+    }
+
+    /// <summary>Resultado de uma chamada ao provedor de modelos.</summary>
+    private sealed record RespostaModelo(
+        string? Texto, string? ModeloUsado, string? Erro, HttpStatusCode? StatusUpstream)
+    {
+        public bool Sucesso => !string.IsNullOrWhiteSpace(Texto);
+
+        public static RespostaModelo Ok(string texto, string modeloUsado) =>
+            new(texto, modeloUsado, null, null);
+
+        public static RespostaModelo Falha(string erro, HttpStatusCode? status) =>
+            new(null, null, erro, status);
     }
 }

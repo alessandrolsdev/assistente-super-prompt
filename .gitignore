@@ -32,7 +32,7 @@ frontend/.vercel
 frontend/*.tsbuildinfo
 frontend/next-env.d.ts
 
-# Vari?veis de ambiente
+# Variaveis de ambiente
 frontend/.env
 frontend/.env.*
 frontend/.env*.local
@@ -41,16 +41,16 @@ frontend/.env*.local
 # =========================
 # .NET / C# (Backend)
 # =========================
-# Pastas de compila??o (Arquivos bin?rios pesados)
+# Pastas de compilacao (binarios pesados)
 backend/bin/
 backend/obj/
 
-# Arquivo de configura??o sens?vel local
+# Arquivo de configuracao sensivel local
 backend/appsettings.Development.json
 backend/appsettings.*.json
 !backend/appsettings.Example.json
 
-# Arquivos de cache e usu?rio do Visual Studio / VS Code
+# Arquivos de cache e usuario do Visual Studio / VS Code
 *.user
 *.suo
 .vscode/

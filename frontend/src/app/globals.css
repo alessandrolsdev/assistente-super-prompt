@@ -2,4 +2,82 @@
 @tailwind components;
 @tailwind utilities;
 
-/* O resto do arquivo pode ficar vazio! */
+/*
+ * Estilos globais da aplicação.
+ *
+ * Antes estas regras viviam duplicadas em duas tags <style> dentro de page.tsx,
+ * cada uma com um @import de Google Fonts em runtime. As fontes agora são
+ * carregadas por next/font em layout.tsx e expostas como variáveis CSS.
+ */
+
+*,
+*::before,
+*::after {
+  font-family: var(--font-syne), sans-serif;
+  box-sizing: border-box;
+}
+
+.mono {
+  font-family: var(--font-jetbrains-mono), monospace !important;
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(163, 230, 53, 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(163, 230, 53, 0.022) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+.glow-input:focus {
+  box-shadow:
+    0 0 0 1px rgba(163, 230, 53, 0.3),
+    0 0 18px rgba(163, 230, 53, 0.06);
+}
+
+.scanline::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.05) 2px,
+    rgba(0, 0, 0, 0.05) 4px
+  );
+}
+
+@keyframes sd {
+  from { stroke-dashoffset: 226; }
+  to   { stroke-dashoffset: var(--t); }
+}
+
+.score-ring {
+  animation: sd 1.2s ease-out forwards;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(163, 230, 53, 0.18);
+  border-radius: 4px;
+}
+
+/* Respeita quem pediu menos animação no sistema operacional. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

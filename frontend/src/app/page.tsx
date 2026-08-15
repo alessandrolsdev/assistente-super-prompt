@@ -3,11 +3,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence, Reorder } from "framer-motion";
 import {
-  ArrowRight, CheckCircle2, Copy, Check, Pencil, Cpu, Zap, Shield,
-  AlertTriangle, Clock, Download, Sparkles, RotateCcw, FileText,
+  ArrowRight, CheckCircle2, Copy, Check, Pencil, Zap, Shield,
+  AlertTriangle, Clock, Download, Sparkles,
   GripVertical, Trash2, RefreshCw, MessageSquare, Send, FolderOpen,
   Image as ImageIcon, Film, Code2, GitBranch, PenTool, Layout,
-  HelpCircle, X, ChevronDown, ChevronUp, ChevronRight
+  HelpCircle, X, ChevronDown, ChevronUp
 } from "lucide-react";
 
 // ─────────────────────────────────────────────────────────────
@@ -84,6 +84,13 @@ interface ClarificacaoResult {
 
 type ResultData = PromptResult | PlanoResult | ClarificacaoResult;
 
+/** Corpo de erro devolvido pelo backend (contrato de `PromptController`). */
+interface ApiErro {
+  erro?: string;
+  detalhes?: string;
+  trace_id?: string;
+}
+
 // ─────────────────────────────────────────────────────────────
 // CONFIGURAÇÕES DOS OBJETIVOS
 // ─────────────────────────────────────────────────────────────
@@ -98,10 +105,129 @@ const OBJETIVOS: Record<TipoObjetivo, ObjetivoMeta> = {
 };
 
 const CHARS = "01アイウエカキ∆∑∏∫≈≠∞";
-const API   = "http://localhost:5117/api/prompt";
+
+// A URL base vem do ambiente (ver frontend/.env.example); o localhost fica
+// apenas como padrão de desenvolvimento.
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:5117").replace(/\/+$/, "");
+const API   = `${API_BASE}/api/prompt`;
+
 const LS_KEY_QUEUE   = "pa_queue_v8";
 const LS_KEY_PROJETO = "pa_projeto_v8";
 const LS_KEY_RESULTADO = "pa_resultado_v8";
+
+// ─────────────────────────────────────────────────────────────
+// CLIENTE DA API
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Lê a resposta do backend tratando os três casos que antes passavam batido:
+ * status de erro, corpo vazio e corpo que não é JSON. Sem isso, um 500 virava
+ * um objeto sem `tipo_resposta` e o chamador seguia como se nada tivesse
+ * acontecido.
+ */
+async function lerRespostaApi<T>(res: Response): Promise<T> {
+  const texto = await res.text();
+
+  let data: unknown = null;
+  if (texto) {
+    try { data = JSON.parse(texto); } catch { /* resposta não-JSON: tratada abaixo */ }
+  }
+
+  if (!res.ok) {
+    const erro = data as ApiErro | null;
+    throw new Error(erro?.erro ?? erro?.detalhes ?? `Erro ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
+  }
+
+  if (data === null) throw new Error("A API respondeu sem conteúdo utilizável.");
+
+  return data as T;
+}
+
+async function postApi<T>(rota: string, body: unknown): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API}/${rota}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error(`Não foi possível falar com a API em ${API_BASE}. Verifique se o backend está rodando.`);
+  }
+  return lerRespostaApi<T>(res);
+}
+
+function mensagemDeErro(e: unknown): string {
+  return e instanceof Error ? e.message : "Erro desconhecido.";
+}
+
+// ─────────────────────────────────────────────────────────────
+// PERSISTÊNCIA LOCAL
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Grava no localStorage. Valores vazios REMOVEM a chave — antes a fila só era
+ * escrita quando tinha itens, então apagar todas as tarefas não limpava nada e
+ * elas voltavam no reload seguinte.
+ */
+function salvarLocal(chave: string, valor: unknown) {
+  try {
+    const vazio = valor == null || (Array.isArray(valor) && valor.length === 0);
+    if (vazio) localStorage.removeItem(chave);
+    else localStorage.setItem(chave, JSON.stringify(valor));
+  } catch {
+    // Quota estourada ou storage indisponível: a persistência é best-effort.
+  }
+}
+
+function lerLocal<T>(chave: string): T | null {
+  try {
+    const raw = localStorage.getItem(chave);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// UTILITÁRIOS
+// ─────────────────────────────────────────────────────────────
+
+function baixarTexto(conteudo: string, nome: string) {
+  const url = URL.createObjectURL(new Blob([conteudo], { type: "text/plain;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nome;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/** Títulos vêm do LLM e podem trazer `/`, `:` e afins, inválidos em nome de arquivo. */
+function nomeDeArquivo(titulo: string): string {
+  const limpo = titulo.replace(/[^\p{L}\p{N} _-]/gu, "").trim().slice(0, 40);
+  return limpo || "prompt";
+}
+
+async function copiar(texto: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(texto);
+    return true;
+  } catch {
+    // clipboard exige contexto seguro (https ou localhost).
+    return false;
+  }
+}
+
+/** Converte o score do backend, que pode vir como "N/A", em número utilizável. */
+function lerScore(valor: string | undefined): number | null {
+  const n = Number.parseInt(valor ?? "", 10);
+  return Number.isFinite(n) ? Math.min(Math.max(n, 0), 100) : null;
+}
+
+function corDoScore(score: number | null): string {
+  if (score === null) return "#71717a";
+  return score >= 85 ? "#a3e635" : score >= 70 ? "#facc15" : "#f87171";
+}
 
 const STAGES = [
   { label: "Classificando objetivo",       color: "text-pink-400",   bg: "bg-pink-500/10",   border: "border-pink-500/20"   },
@@ -316,7 +442,7 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
                 </span>
                 {tarefa.score && (
                   <span className="mono text-[9px] text-zinc-600">
-                    score <span style={{color:parseInt(tarefa.score)>=85?"#a3e635":parseInt(tarefa.score)>=70?"#facc15":"#f87171"}}>{tarefa.score}</span>
+                    score <span style={{color:corDoScore(lerScore(tarefa.score))}}>{tarefa.score}</span>
                   </span>
                 )}
                 {!done && !gerando && (
@@ -329,15 +455,16 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          <button onClick={onToggle} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-zinc-400 transition-colors">
+          <button onClick={onToggle} aria-expanded={expanded} aria-label={expanded?"Recolher detalhes da tarefa":"Expandir detalhes da tarefa"}
+            className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-zinc-400 transition-colors">
             {expanded ? <ChevronUp className="w-3.5 h-3.5"/> : <ChevronDown className="w-3.5 h-3.5"/>}
           </button>
-          {!editando && <button onClick={()=>setEditando(true)} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Pencil className="w-3.5 h-3.5"/></button>}
+          {!editando && <button onClick={()=>setEditando(true)} aria-label="Editar tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Pencil className="w-3.5 h-3.5"/></button>}
           {done && <>
-            <button onClick={()=>setShowReg(r=>!r)} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-blue-400 transition-colors"><RefreshCw className="w-3.5 h-3.5"/></button>
-            <button onClick={onDownload} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Download className="w-3.5 h-3.5"/></button>
+            <button onClick={()=>setShowReg(r=>!r)} aria-label="Regerar prompt desta tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-blue-400 transition-colors"><RefreshCw className="w-3.5 h-3.5"/></button>
+            <button onClick={onDownload} aria-label="Baixar prompt desta tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Download className="w-3.5 h-3.5"/></button>
           </>}
-          <button onClick={onDeletar} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-red-400 transition-colors"><Trash2 className="w-3.5 h-3.5"/></button>
+          <button onClick={onDeletar} aria-label="Excluir tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-red-400 transition-colors"><Trash2 className="w-3.5 h-3.5"/></button>
         </div>
       </div>
       <AnimatePresence>
@@ -378,47 +505,72 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
   const [stageIndex, setStageIndex]       = useState(0);
   const [chatMsgs, setChatMsgs]           = useState<{role:"user"|"ia";texto:string}[]>([]);
   const [chatInput, setChatInput]         = useState("");
+  const [erro, setErro]                   = useState<string|null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { chatRef.current?.scrollTo({top:chatRef.current.scrollHeight,behavior:"smooth"}); }, [chatMsgs]);
   useEffect(() => { if(!loading)return; const id=setInterval(()=>setStageIndex(p=>Math.min(p+1,STAGES.length-1)),4000); return ()=>clearInterval(id); }, [loading]);
 
-  const toggleExpand = (id:string) => setExpandedIds(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
+  const toggleExpand = (id:string) => setExpandedIds(s=>{
+    const n = new Set(s);
+    if (n.has(id)) n.delete(id); else n.add(id);
+    return n;
+  });
 
   const gerarTarefa = useCallback(async (tarefa:TarefaQueue) => {
-    setLoading(true); setStageIndex(0); setTarefaAtivaId(tarefa.id);
+    setLoading(true); setStageIndex(0); setTarefaAtivaId(tarefa.id); setErro(null);
     setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"gerando"}:t));
     try {
-      const res = await fetch(`${API}/gerar`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ideiaBruta:`${tarefa.titulo}: ${tarefa.descricao}`,forcarSimples:true,tipoSugerido:tarefa.tipo})});
-      const data = await res.json();
-      if(data.tipo_resposta==="prompt_gerado"){
-        setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade,papel:data.deteccao?.papel_detectado}:t));
-        setPromptAtivo(data.prompt_otimizado); setTarefaPromptId(tarefa.id);
-        setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt gerado para "${tarefa.titulo}" · score ${data.pipeline?.score_qualidade}`}]);
-      }
-    } catch { setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"aguardando"}:t)); }
+      const data = await postApi<PromptResult>("gerar", {
+        ideiaBruta: `${tarefa.titulo}: ${tarefa.descricao}`,
+        forcarSimples: true,
+        tipoSugerido: tarefa.tipo,
+      });
+
+      if (data.tipo_resposta !== "prompt_gerado" || !data.prompt_otimizado)
+        throw new Error("A API não devolveu um prompt para esta tarefa.");
+
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade,papel:data.deteccao?.papel_detectado}:t));
+      setPromptAtivo(data.prompt_otimizado); setTarefaPromptId(tarefa.id);
+      setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt gerado para "${tarefa.titulo}" · score ${data.pipeline?.score_qualidade}`}]);
+    } catch (e) {
+      // Sem este reset a tarefa ficava presa em "gerando" para sempre.
+      const msg = mensagemDeErro(e);
+      setErro(msg);
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"aguardando"}:t));
+      setChatMsgs(m=>[...m,{role:"ia",texto:`✕ Falha ao gerar "${tarefa.titulo}": ${msg}`}]);
+    }
     finally { setLoading(false); setTarefaAtivaId(null); }
   },[setQueue]);
 
   const regerarTarefa = useCallback(async (tarefa:TarefaQueue, instrucao:string) => {
     if(!tarefa.prompt)return;
-    setLoading(true); setStageIndex(4); setTarefaAtivaId(tarefa.id);
+    setLoading(true); setStageIndex(4); setTarefaAtivaId(tarefa.id); setErro(null);
     setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"gerando"}:t));
     try {
-      const res = await fetch(`${API}/regerar`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({promptAtual:tarefa.prompt,instrucaoMelhora:instrucao,papel:tarefa.papel,tipoObjetivo:tarefa.tipo})});
-      const data = await res.json();
-      if(data.prompt_otimizado){
-        setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",historico:[...(t.historico??[]),{prompt:t.prompt!,score:t.score!,instrucao}],prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade}:t));
-        setPromptAtivo(data.prompt_otimizado);
-        setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt de "${tarefa.titulo}" regerado · score ${data.pipeline?.score_qualidade}`}]);
-      }
-    } catch { setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido"}:t)); }
+      const data = await postApi<PromptResult>("regerar", {
+        promptAtual: tarefa.prompt,
+        instrucaoMelhora: instrucao,
+        papel: tarefa.papel,
+        tipoObjetivo: tarefa.tipo,
+      });
+
+      if (!data.prompt_otimizado)
+        throw new Error("A API não devolveu o prompt regerado.");
+
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",historico:[...(t.historico??[]),{prompt:t.prompt!,score:t.score??"N/A",instrucao}],prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade}:t));
+      setPromptAtivo(data.prompt_otimizado);
+      setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt de "${tarefa.titulo}" regerado · score ${data.pipeline?.score_qualidade}`}]);
+    } catch (e) {
+      const msg = mensagemDeErro(e);
+      setErro(msg);
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido"}:t));
+      setChatMsgs(m=>[...m,{role:"ia",texto:`✕ Falha ao regerar "${tarefa.titulo}": ${msg}`}]);
+    }
     finally { setLoading(false); setTarefaAtivaId(null); }
   },[setQueue]);
 
-  const dl = (t:TarefaQueue) => { if(!t.prompt)return; const b=new Blob([t.prompt],{type:"text/plain"}); const u=URL.createObjectURL(b); const a=document.createElement("a"); a.href=u;a.download=`${t.titulo.slice(0,30)}.txt`;a.click();URL.revokeObjectURL(u); };
+  const dl = (t:TarefaQueue) => { if(!t.prompt)return; baixarTexto(t.prompt, `${nomeDeArquivo(t.titulo)}.txt`); };
   const concluidos=queue.filter(t=>t.status==="concluido").length;
   const total=queue.length;
   const progresso=total>0?Math.round((concluidos/total)*100):0;
@@ -426,7 +578,6 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
 
   return (
     <div className="min-h-screen flex flex-col" style={{background:"#030712"}}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=JetBrains+Mono:wght@400;500&display=swap');*,*::before,*::after{font-family:'Syne',sans-serif;box-sizing:border-box}.mono{font-family:'JetBrains Mono',monospace!important}.bg-grid{background-image:linear-gradient(rgba(163,230,53,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(163,230,53,0.02) 1px,transparent 1px);background-size:44px 44px}::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(163,230,53,0.15);border-radius:4px}`}</style>
       <div className="fixed inset-0 bg-grid pointer-events-none"/>
       {/* Top bar */}
       <div className="relative z-10 flex items-center justify-between px-6 py-3 border-b border-zinc-800/60" style={{background:"rgba(3,7,18,0.9)",backdropFilter:"blur(20px)"}}>
@@ -464,7 +615,7 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
           </div>
           <div className="flex-1 overflow-y-auto p-3">
             <Reorder.Group axis="y" values={queue} onReorder={setQueue} className="space-y-2">
-              {queue.map((tarefa,i)=>(
+              {queue.map((tarefa)=>(
                 <Reorder.Item key={tarefa.id} value={tarefa} dragListener={false}>
                   <TodoItem tarefa={tarefa} ativo={tarefa.id===tarefaAtivaId}
                     expanded={expandedIds.has(tarefa.id)} onToggle={()=>toggleExpand(tarefa.id)}
@@ -497,6 +648,17 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
               </motion.div>
             )}
           </AnimatePresence>
+          <AnimatePresence>
+            {erro && (
+              <motion.div initial={{opacity:0,y:-8}} animate={{opacity:1,y:0}} exit={{opacity:0}} role="alert"
+                className="m-4 flex items-start gap-3 px-4 py-3 rounded-xl border border-red-500/25 bg-red-500/5">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5"/>
+                <p className="mono text-[11px] text-red-200 break-words flex-1">{erro}</p>
+                <button onClick={()=>setErro(null)} aria-label="Fechar aviso de erro"
+                  className="text-zinc-600 hover:text-zinc-300 transition-colors shrink-0"><X className="w-4 h-4"/></button>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <div className="flex-1 overflow-y-auto p-6">
             {promptAtivo ? (
               <div className="space-y-3">
@@ -507,7 +669,7 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
                   </div>
                   <div className="flex gap-2">
                     <button onClick={()=>{const t=queue.find(t=>t.id===tarefaPromptId);if(t)dl(t);}} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Download className="w-3 h-3"/>baixar</button>
-                    <button onClick={()=>navigator.clipboard.writeText(promptAtivo)} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Copy className="w-3 h-3"/>copiar</button>
+                    <button onClick={async()=>{ if(!await copiar(promptAtivo)) setErro("Não foi possível copiar: o navegador bloqueia a área de transferência fora de https ou localhost."); }} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Copy className="w-3 h-3"/>copiar</button>
                   </div>
                 </div>
                 <div className="p-5 rounded-xl border border-zinc-800/60 bg-zinc-900/40">
@@ -590,9 +752,24 @@ export default function Home() {
   );
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { try { const q=localStorage.getItem(LS_KEY_QUEUE); const p=localStorage.getItem(LS_KEY_PROJETO); const r=localStorage.getItem(LS_KEY_RESULTADO); if(q)setQueue(JSON.parse(q)); if(p)setIdeiaProjeto(JSON.parse(p)); if(r)setResultado(JSON.parse(r)); } catch{} }, []);
-  useEffect(() => { if(queue.length>0)localStorage.setItem(LS_KEY_QUEUE,JSON.stringify(queue)); }, [queue]);
-  useEffect(() => { if(resultado)localStorage.setItem(LS_KEY_RESULTADO,JSON.stringify(resultado)); }, [resultado]);
+  // Restaura o estado salvo apenas no cliente, para não divergir do HTML do SSR.
+  const [hidratado, setHidratado] = useState(false);
+  useEffect(() => {
+    const q = lerLocal<TarefaQueue[]>(LS_KEY_QUEUE);
+    const p = lerLocal<string>(LS_KEY_PROJETO);
+    const r = lerLocal<PromptResult>(LS_KEY_RESULTADO);
+    if (Array.isArray(q)) setQueue(q);
+    if (typeof p === "string") setIdeiaProjeto(p);
+    if (r?.prompt_otimizado) setResultado(r);
+    setHidratado(true);
+  }, []);
+
+  // Só persiste depois de hidratar: gravar antes sobrescreveria o estado salvo
+  // com os valores iniciais vazios.
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_QUEUE, queue); }, [queue, hidratado]);
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_RESULTADO, resultado); }, [resultado, hidratado]);
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_PROJETO, ideiaProjeto || null); }, [ideiaProjeto, hidratado]);
+
   useEffect(() => { if(!loading)return; const id=setInterval(()=>setStageIndex(p=>Math.min(p+1,STAGES.length-1)),4000); return ()=>clearInterval(id); }, [loading]);
 
 
@@ -611,40 +788,28 @@ export default function Home() {
       if (opts.respostas && Object.keys(opts.respostas).length > 0) body.respostasClarificacao = opts.respostas;
       if (executorSelecionado.trim()) body.executorAlvo = executorSelecionado.trim();
 
-      setErroAPI(null);
-      const res  = await fetch(`${API}/gerar`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
-      const data: any = await res.json();
-
-      if (!res.ok) {
-        const msg = data?.erro ?? data?.detalhes ?? `Erro ${res.status}`;
-        setErroAPI(msg);
-        return;
-      }
+      const data = await postApi<ResultData>("gerar", body);
 
       if (data.tipo_resposta === "clarificacao_necessaria") {
-        const c = data as ClarificacaoResult;
-        setPerguntas(c.perguntas);
-        setTipoConfirmado(c.tipo_confirmado);
+        setPerguntas(data.perguntas ?? []);
+        setTipoConfirmado(data.tipo_confirmado);
         setAppState("clarificando");
       } else if (data.tipo_resposta === "plano_de_divisao") {
-        const p = data as PlanoResult;
-        setTipoConfirmado(p.tipo_confirmado);
-        const novas = p.sub_tarefas.map((s,i) => ({
+        setTipoConfirmado(data.tipo_confirmado);
+        const novas: TarefaQueue[] = (data.sub_tarefas ?? []).map((s,i) => ({
           id:`${Date.now()}_${i}`, titulo:s.titulo, descricao:s.descricao,
-          complexidade:s.complexidade as TarefaQueue["complexidade"],
-          status:"aguardando" as const, tipo:p.tipo_confirmado,
+          complexidade:s.complexidade, status:"aguardando" as const, tipo:data.tipo_confirmado,
         }));
-        setQueue(novas); setIdeiaProjeto(opts.ideiaTexto);
-        localStorage.setItem(LS_KEY_PROJETO, JSON.stringify(opts.ideiaTexto));
+        setQueue(novas);
+        setIdeiaProjeto(opts.ideiaTexto);
         setAppState("projeto");
       } else {
-        const pr = data as PromptResult;
-        setTipoConfirmado(pr.deteccao?.tipo_confirmado);
-        setResultado(pr);
+        setTipoConfirmado(data.deteccao?.tipo_confirmado);
+        setResultado(data);
         setAppState("home");
       }
-    } catch (e: any) {
-      setErroAPI(`Erro de conexão: ${e?.message ?? "Verifique se a API C# está rodando em localhost:5117"}`);
+    } catch (e) {
+      setErroAPI(mensagemDeErro(e));
     } finally { setLoading(false); }
   }, [papelEditado, tipoSelecionado, executorSelecionado]);
 
@@ -652,22 +817,14 @@ export default function Home() {
     return <PaginaProjeto ideiaProjeto={ideiaProjeto} queue={queue} setQueue={setQueue} onVoltar={()=>setAppState("home")}/>;
   }
 
-  const scoreNum   = parseInt(resultado?.pipeline?.score_qualidade ?? "0", 10);
-  const scoreColor = scoreNum >= 85 ? "#a3e635" : scoreNum >= 70 ? "#facc15" : "#f87171";
+  // O backend pode devolver "N/A"; sem esta guarda o valor virava NaN e o
+  // strokeDasharray do anel de score saía inválido.
+  const scoreNum   = lerScore(resultado?.pipeline?.score_qualidade);
+  const scoreColor = corDoScore(scoreNum);
+  const scoreDash  = scoreNum === null ? 226 : 226 - (226 * scoreNum) / 100;
 
   return (
     <div className="relative min-h-screen overflow-hidden flex flex-col items-center py-12 px-6" style={{background:"#030712"}}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-        *,*::before,*::after{font-family:'Syne',sans-serif;box-sizing:border-box}
-        .mono{font-family:'JetBrains Mono',monospace!important}
-        .bg-grid{background-image:linear-gradient(rgba(163,230,53,0.022) 1px,transparent 1px),linear-gradient(90deg,rgba(163,230,53,0.022) 1px,transparent 1px);background-size:44px 44px}
-        .glow-input:focus{box-shadow:0 0 0 1px rgba(163,230,53,0.3),0 0 18px rgba(163,230,53,0.06)}
-        .scanline::before{content:'';position:absolute;inset:0;pointer-events:none;z-index:1;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.05) 2px,rgba(0,0,0,0.05) 4px)}
-        @keyframes sd{from{stroke-dashoffset:226}to{stroke-dashoffset:var(--t)}}.score-ring{animation:sd 1.2s ease-out forwards}
-        ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(163,230,53,0.18);border-radius:4px}
-      `}</style>
-
       <div className="fixed inset-0 bg-grid pointer-events-none"/>
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         {cols.map((c,i)=><MatrixCol key={i} x={c.x} delay={c.delay} chars={c.chars} duration={c.duration}/>)}
@@ -679,7 +836,7 @@ export default function Home() {
         {/* Header */}
         <motion.div initial={{opacity:0,y:-20}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:[0.16,1,0.3,1]}} className="space-y-2">
           <div className="flex items-center justify-between">
-            <div className="mono text-xs text-lime-500 tracking-[0.25em] uppercase">v6.0 · Multi-objetivo + Visão</div>
+            <div className="mono text-xs text-lime-500 tracking-[0.25em] uppercase">v6.0 · Multi-objetivo</div>
             {queue.length > 0 && (
               <button onClick={()=>setAppState("projeto")}
                 className="flex items-center gap-1.5 mono text-[11px] text-zinc-500 hover:text-lime-400 border border-zinc-800 hover:border-lime-500/30 px-3 py-1.5 rounded-lg transition-all">
@@ -748,6 +905,7 @@ export default function Home() {
               </span>
             )}
             <button onClick={()=>{setEditandoPapel(true);setTimeout(()=>inputRef.current?.focus(),40);}}
+              aria-label="Editar o papel técnico usado no prompt"
               className="shrink-0 p-1.5 rounded-md hover:bg-zinc-800 transition-colors group">
               <Pencil className="w-3 h-3 text-zinc-600 group-hover:text-lime-400 transition-colors"/>
             </button>
@@ -794,7 +952,7 @@ export default function Home() {
         {/* Erro da API */}
         <AnimatePresence>
           {erroAPI && !loading && (
-            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0}}
+            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0}} role="alert"
               className="flex items-start gap-3 px-4 py-3.5 rounded-xl border border-red-500/25 bg-red-500/5">
               <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5"/>
               <div className="flex-1 min-w-0">
@@ -802,7 +960,7 @@ export default function Home() {
                 <p className="mono text-[11px] text-zinc-500 mt-0.5 break-words">{erroAPI}</p>
                 <p className="mono text-[10px] text-zinc-700 mt-1">Veja o console do dotnet para mais detalhes.</p>
               </div>
-              <button onClick={()=>setErroAPI(null)} className="text-zinc-700 hover:text-zinc-400 transition-colors shrink-0">
+              <button onClick={()=>setErroAPI(null)} aria-label="Fechar aviso de erro" className="text-zinc-700 hover:text-zinc-400 transition-colors shrink-0">
                 <X className="w-4 h-4"/>
               </button>
             </motion.div>
@@ -841,7 +999,7 @@ export default function Home() {
                   <svg width="56" height="56" viewBox="0 0 80 80">
                     <circle cx="40" cy="40" r="36" fill="none" stroke="#1f2937" strokeWidth="6"/>
                     <circle cx="40" cy="40" r="36" fill="none" stroke={scoreColor} strokeWidth="6" strokeLinecap="round" strokeDasharray="226" className="score-ring"
-                      style={{transformOrigin:"center",transform:"rotate(-90deg)","--t":`${226-(226*scoreNum)/100}`} as React.CSSProperties}/>
+                      style={{transformOrigin:"center",transform:"rotate(-90deg)","--t":`${scoreDash}`} as React.CSSProperties}/>
                     <text x="40" y="46" textAnchor="middle" fill={scoreColor} fontSize="17" fontWeight="800" fontFamily="JetBrains Mono">{resultado?.pipeline?.score_qualidade}</text>
                   </svg>
                 </div>
@@ -857,11 +1015,14 @@ export default function Home() {
                     <span className="mono text-[11px] text-zinc-500 tracking-widest uppercase">Super Prompt</span>
                   </div>
                   <div className="flex gap-2">
-                    <button onClick={()=>{const b=new Blob([resultado.prompt_otimizado],{type:"text/plain"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="prompt.txt";a.click();URL.revokeObjectURL(u);}}
+                    <button onClick={()=>baixarTexto(resultado.prompt_otimizado,"prompt.txt")}
                       className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all">
                       <Download className="w-3 h-3"/>baixar
                     </button>
-                    <motion.button onClick={()=>{navigator.clipboard.writeText(resultado.prompt_otimizado);setCopied(true);setTimeout(()=>setCopied(false),2000);}}
+                    <motion.button onClick={async()=>{
+                        if (await copiar(resultado.prompt_otimizado)) { setCopied(true); setTimeout(()=>setCopied(false),2000); }
+                        else setErroAPI("Não foi possível copiar: o navegador bloqueia a área de transferência fora de https ou localhost.");
+                      }}
                       whileTap={{scale:0.94}}
                       className="flex items-center gap-1.5 mono text-[10px] px-3 py-1.5 rounded-lg border transition-all"
                       style={{borderColor:copied?"rgba(163,230,53,0.4)":"rgba(63,63,70,0.5)",color:copied?"#a3e635":"#71717a",background:copied?"rgba(163,230,53,0.05)":"transparent"}}>

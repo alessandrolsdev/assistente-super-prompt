@@ -1,28 +1,43 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Syne, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
 /**
- * Global Inter font configuration sourced from Google Fonts.
- * Kept local to avoid external fetch delays or CORS issues on deployment.
+ * Fontes da aplicação, carregadas e auto-hospedadas por next/font.
+ *
+ * Antes elas vinham de um `@import url('https://fonts.googleapis.com/...')`
+ * dentro de duas tags <style> em `page.tsx`, o que gerava um fetch externo
+ * bloqueante a cada render. Aqui elas são baixadas no build e expostas como
+ * variáveis CSS consumidas por `globals.css`.
  */
-const inter = Inter({ subsets: ["latin"] });
+const syne = Syne({
+  subsets: ["latin"],
+  variable: "--font-syne",
+  display: "swap",
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-jetbrains-mono",
+  display: "swap",
+});
 
 /**
- * Global SEO and Browser Tab Metadata configuration.
- * Next.js automatically injects these into the <head> tag.
+ * Metadados globais de SEO e da aba do navegador.
+ * O Next.js injeta automaticamente no <head>.
  */
 export const metadata: Metadata = {
   title: "Agentic Prompt Builder",
-  description: "Um pipeline de 3 IAs trabalhando em conjunto para transformar sua ideia bruta no prompt perfeito.",
+  description:
+    "Pipeline de multiplos agentes LLM que transforma uma ideia bruta em um prompt otimizado.",
 };
 
 /**
- * Root Application Layout.
- * Wraps all pages. Contains typography definitions, global background colors,
- * and suppresses hydration warnings caused by browser extensions.
- * 
- * @param props.children The nested routes and page content.
+ * Layout raiz da aplicação.
+ * Envolve todas as páginas, define tipografia e cores de fundo globais e
+ * suprime avisos de hidratação causados por extensões do navegador.
+ *
+ * @param props.children Rotas aninhadas e conteúdo da página.
  */
 export default function RootLayout({
   children,
@@ -31,7 +46,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="pt-BR" suppressHydrationWarning>
-      <body className={`${inter.className} antialiased bg-zinc-950 text-zinc-50`} >
+      <body
+        className={`${syne.variable} ${jetbrainsMono.variable} antialiased bg-zinc-950 text-zinc-50`}
+      >
         {children}
       </body>
     </html>

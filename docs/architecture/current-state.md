@@ -9,20 +9,23 @@ It is intentionally descriptive, not aspirational.
 
 ```text
 .
-â”œâ”€ backend/
-â”‚  â”œâ”€ Controllers/PromptController.cs
-â”‚  â”œâ”€ Models/PromptModels.cs
-â”‚  â”œâ”€ Program.cs
-â”‚  â”œâ”€ ApiAssistente.csproj
-â”‚  â”œâ”€ appsettings.json
-â”‚  â””â”€ appsettings.Example.json
-â”œâ”€ frontend/
-â”‚  â”œâ”€ src/app/page.tsx
-â”‚  â”œâ”€ src/app/layout.tsx
-â”‚  â”œâ”€ src/app/globals.css
-â”‚  â””â”€ package.json
-â””â”€ docs/
-   â””â”€ ai/
+├─ backend/
+│  ├─ Configuration/OpenRouterOptions.cs
+│  ├─ Controllers/PromptController.cs
+│  ├─ Models/PromptModels.cs
+│  ├─ Program.cs
+│  ├─ ApiAssistente.csproj
+│  ├─ appsettings.json
+│  └─ appsettings.Example.json
+├─ frontend/
+│  ├─ src/app/page.tsx
+│  ├─ src/app/layout.tsx
+│  ├─ src/app/globals.css
+│  ├─ .env.example
+│  └─ package.json
+└─ docs/
+   ├─ architecture/
+   └─ audit/
 ```
 
 Observed gaps in the repository root:
@@ -36,12 +39,12 @@ Observed gaps in the repository root:
 ### Runtime and entrypoint
 
 - The backend is a single .NET 8 Web API project in `backend/`.
-- [`Program.cs`](/C:/Github/assistente-super-prompt/backend/Program.cs) still acts as startup and also owns an operational diagnostics endpoint: `GET /api/modelos/testar`.
-- Configuration is read directly from `IConfiguration`, with `OpenRouterApiKey` now documented as coming from environment variables, `dotnet user-secrets`, or a local ignored `appsettings.Development.json`.
+- [`Program.cs`](../../backend/Program.cs) still acts as startup and also owns an operational diagnostics endpoint: `GET /api/modelos/testar`.
+- Configuration is bound to `OpenRouterOptions` (section `OpenRouter`), which also accepts the root `OpenRouterApiKey` key documented in the README. Models, timeouts, token budget and CORS origins are configuration-driven.
 
 ### Main behavioral boundary
 
-- [`PromptController.cs`](/C:/Github/assistente-super-prompt/backend/Controllers/PromptController.cs) is the dominant backend module.
+- [`PromptController.cs`](../../backend/Controllers/PromptController.cs) is the dominant backend module.
 - The controller currently owns:
   - request validation
   - prompt pipeline orchestration
@@ -58,7 +61,7 @@ This means the current backend boundary is controller-centric, not service-centr
 
 ### Domain and contract shape
 
-- [`PromptModels.cs`](/C:/Github/assistente-super-prompt/backend/Models/PromptModels.cs) mixes:
+- [`PromptModels.cs`](../../backend/Models/PromptModels.cs) mixes:
   - transport models (`PromptRequest`, `RegerarRequest`)
   - domain enum (`TipoObjetivo`)
   - helper records (`PerguntaClarificacao`, `SubTarefaItem`)
@@ -77,18 +80,18 @@ This means the current backend boundary is controller-centric, not service-centr
 
 ### Current risks
 
-- Rule orchestration, integration and HTTP concerns are tightly coupled in one controller.
-- Error handling still returns internal exception messages in some paths.
-- Configuration, diagnostics and pipeline behavior are not yet isolated into explicit modules.
+- Rule orchestration, integration and HTTP concerns are still tightly coupled in one controller.
+- Configuration is now isolated in `Configuration/OpenRouterOptions.cs`, but orchestration and the OpenRouter gateway are not.
 - There is no automated backend test suite yet.
+- There is no authentication or rate limiting on routes that spend OpenRouter credits.
 
 ## Frontend Today
 
 ### App structure
 
 - The frontend is a Next.js App Router application in `frontend/`.
-- The functional product surface is concentrated in a single file: [`src/app/page.tsx`](/C:/Github/assistente-super-prompt/frontend/src/app/page.tsx).
-- [`layout.tsx`](/C:/Github/assistente-super-prompt/frontend/src/app/layout.tsx) and [`globals.css`](/C:/Github/assistente-super-prompt/frontend/src/app/globals.css) are thin compared to `page.tsx`.
+- The functional product surface is concentrated in a single file: [`src/app/page.tsx`](../../frontend/src/app/page.tsx).
+- [`layout.tsx`](../../frontend/src/app/layout.tsx) and [`globals.css`](../../frontend/src/app/globals.css) are thin compared to `page.tsx`.
 
 ### What `page.tsx` currently owns
 
@@ -116,10 +119,10 @@ The frontend is therefore page-centric and feature-coupled.
 ### Current risks
 
 - Backend contract parsing is embedded in the page.
-- API base URL is still hardcoded in the page.
 - Product behavior and presentation are coupled.
 - The page is too large to review safely as one unit for future feature work.
 - There is no frontend test runner or component test coverage yet.
+- Some UI affordances are inert: drag-to-reorder, the project chat and the per-task history are rendered or stored but do nothing.
 
 ## Contracts and Flows
 
@@ -150,8 +153,9 @@ The current contract is functional but not formally versioned or centralized.
 
 ## Documentation and operational guardrails today
 
-- [`README.md`](/C:/Github/assistente-super-prompt/README.md) now reflects safer local secret handling, but it is not yet the full architecture source of truth.
-- `docs/ai/` contains Codex operating prompts and review checklists.
+- [`README.md`](../../README.md) now reflects safer local secret handling, but it is not yet the full architecture source of truth.
+- `docs/architecture/` contains the ADR, this document and the target state.
+- `docs/audit/` contains the code audit reports.
 - There is still no repository-level CI pipeline in `.github/workflows`.
 
 ## What should be preserved right now
