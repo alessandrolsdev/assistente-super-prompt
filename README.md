@@ -20,6 +20,20 @@ O motor C# (backend) orquestra chamadas de modelos com funcoes especificas. O fr
 
 O modelo usado em cada etapa e configuravel (ver [Configuracao do OpenRouter](#configuracao-do-openrouter)).
 
+### Controles de saida
+
+Tres opcoes moldam o prompt gerado, disponiveis tanto ao gerar quanto ao refinar:
+
+| Controle | Opcoes | Efeito |
+| --- | --- | --- |
+| **Executor** | Qualquer IA, Claude Code, Jules, OpenHands, Cursor, Windsurf | Molda estrutura e nivel de autonomia do prompt para o assistente que vai executa-lo |
+| **Nivel de detalhe** | Conciso, Equilibrado, Exaustivo | Ajusta a extensao e o orcamento de tokens da geracao |
+| **Idioma** | Como escrevi, Portugues, Ingles | Fixa o idioma do prompt gerado |
+
+Os perfis de executor ficam em [backend/Models/ExecutorPerfis.cs](backend/Models/ExecutorPerfis.cs). Um prompt para o Claude Code (agente de terminal que explora o repositorio) declara objetivo e criterios verificaveis em vez de passo a passo; um para o Cursor e curto, nomeia arquivos e pede diff; um para o Jules e uma especificacao completa, porque nao ha como esclarecer nada durante a execucao.
+
+Na tela de projeto existe ainda o campo **Contexto do projeto** — stack, convencoes e restricoes que valem para todas as sub-tarefas e sao injetados em cada geracao.
+
 ---
 
 ## Tecnologias Empregadas

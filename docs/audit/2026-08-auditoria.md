@@ -8,23 +8,27 @@ O que foi feito:
 
 - leitura integral dos 4 arquivos de código do projeto (`Program.cs`, `PromptController.cs`, `PromptModels.cs`, `page.tsx`) e de toda a configuração;
 - verificação de encoding byte a byte em todos os arquivos rastreados;
-- execução de `tsc --noEmit`, `eslint` e `next build` no frontend, antes e depois das correções.
+- execução de `tsc --noEmit`, `eslint` e `next build` no frontend, antes e depois das correções;
+- inspeção da aplicação rodando em navegador (Chromium via Playwright), que revelou o defeito de layout Q-9.
 
 Limitação importante: **o SDK do .NET não está disponível neste ambiente** (o proxy bloqueia o instalador), então **as mudanças no backend não foram compiladas**. Elas foram revisadas manualmente — balanceamento de delimitadores, escapes de strings verbatim interpoladas, atribuição definida nos blocos `try`/`catch`, resolução de `using` — mas **`dotnet build` precisa ser rodado antes do merge**. O frontend, esse sim, está verificado: typecheck, lint e build passam limpos.
 
-Severidades: **P0** quebra ou degrada o produto agora · **P1** falha em condição comum · **P2** manutenção, risco futuro, higiene.
+Severidades: **P0** quebra ou degrada o produto agora · **P1** falha em condição comum · **P2** manutenção, risco futuro, higiene · **Q** qualidade do produto e usabilidade.
 
 ---
 
 ## Resumo
 
+Duas rodadas: a primeira corrigiu defeitos, a segunda melhorou qualidade dos prompts e usabilidade.
+
 | Severidade | Achados | Corrigidos | Pendentes |
 | --- | --- | --- | --- |
-| P0 | 5 | 5 | 0 |
-| P1 | 11 | 11 | 0 |
-| P2 | 14 | 6 | 8 |
+| P0 — crítico | 5 | 5 | 0 |
+| P1 — alto | 11 | 11 | 0 |
+| P2 — manutenção | 14 | 8 | 6 |
+| Q — qualidade e usabilidade (rodada 2) | 9 | 9 | 0 |
 
-Os 8 pendentes são trabalho que o [ADR-001](../architecture/adr-001-modular-monolith-first.md) já mapeou para o backlog de refatoração incremental (#3 a #8) — não foram feitos aqui porque o ADR pede fatias do tamanho de uma issue, e não um rewrite.
+Os 6 pendentes são trabalho que o [ADR-001](../architecture/adr-001-modular-monolith-first.md) já mapeou para o backlog de refatoração incremental (#3 a #8) — não foram feitos aqui porque o ADR pede fatias do tamanho de uma issue, e não um rewrite.
 
 ---
 
@@ -80,7 +84,7 @@ if (data.tipo_resposta === "prompt_gerado") { /* ... */ }
 
 Em qualquer erro do backend, a tarefa ficava com `status: "gerando"` permanentemente — spinner girando, nenhuma mensagem de erro, e o estado ainda era persistido no `localStorage`, então o travamento sobrevivia ao reload. A página de projeto não tinha nenhuma superfície de erro.
 
-**Corrigido:** cliente de API centralizado (`postApi`/`lerRespostaApi`) que trata status de erro, corpo vazio e corpo não-JSON; a tarefa volta para `aguardando`, e o erro aparece num banner e no chat do projeto.
+**Corrigido:** cliente de API centralizado (`postApi`/`lerRespostaApi`) que trata status de erro, corpo vazio e corpo não-JSON; a tarefa volta para `aguardando`, e o erro aparece num banner e no log de atividade.
 
 ### P0-5. `dynamic` sobre tipos anônimos no endpoint de diagnóstico
 
@@ -215,6 +219,72 @@ Títulos vêm do LLM e podem conter `/` e `:`, inválidos em nome de arquivo. E 
 
 ---
 
+## Rodada 2 — Qualidade dos prompts e usabilidade
+
+Segunda passada, focada em melhorar o produto em si e não só em consertar defeitos.
+
+### Q-1. O gabarito XML voltava sem ser preenchido
+
+A etapa de geração mandava um esqueleto onde cada campo continha a *instrução* do que escrever:
+
+```xml
+<restricoes_constitucionais>6 restrições NUNCA/SEMPRE específicas para Codigo.</restricoes_constitucionais>
+```
+
+Modelos pequenos ecoam esse texto em vez de substituí-lo — e o resultado, um gabarito vazio disfarçado de prompt, saía direto para o usuário. É o modo de falha mais comum de prompt-como-gabarito.
+
+**Feito:** os campos agora usam `[colchetes]` marcados explicitamente como instrução, com uma regra crítica no system prompt e um exemplo do erro a evitar (errado × certo lado a lado). A etapa de auditoria também passou a tratar gabarito não preenchido como problema grave.
+
+### Q-2. A validação pedia o prompt inteiro de volta
+
+`<prompt_final>Corrija problemas reais. Se tudo ok: copie sem alterações.</prompt_final>` obrigava o modelo a reemitir todo o prompt mesmo quando não havia nada a corrigir: custo dobrado na etapa mais pesada e a maior superfície de truncamento do pipeline.
+
+**Feito:** auditoria com diagnóstico primeiro. O validador responde `<precisa_correcao>` e só preenche `<prompt_final>` quando aponta problema real; caso contrário o prompt da geração passa intacto. No caminho feliz — a maioria — a etapa ficou muito mais barata e não há mais como perder conteúdo na cópia.
+
+### Q-3. O executor era uma nota solta no fim da ideia
+
+`ExecutorAlvo` virava `[EXECUTOR DO PROMPT: Claude Code — otimize a estrutura...]` colado no fim da ideia bruta. Genérico o bastante para não mudar nada: a mesma frase para Cursor, Jules e OpenHands.
+
+**Feito:** `backend/Models/ExecutorPerfis.cs` com perfis reais. Um prompt para o Claude Code (agente de terminal que explora o repositório) declara objetivo e critérios verificáveis em vez de passo a passo; para o Cursor é curto e nomeia arquivos, pedindo diff; para o Jules é especificação completa, porque não há como perguntar durante a execução; para o OpenHands inclui setup, verificação e condição de parada. Executor desconhecido cai no perfil autocontido, mas ainda é citado pelo nome.
+
+### Q-4. Nenhum controle sobre extensão e idioma
+
+O usuário não tinha como pedir um prompt mais curto nem fixar o idioma de saída — relevante porque o executor final costuma ser anglófono enquanto a ideia é escrita em português.
+
+**Feito:** **nível de detalhe** (Conciso · Equilibrado · Exaustivo), que ajusta a diretriz e o orçamento de tokens da geração, e **idioma de saída** (como escrevi · português · inglês). Ambos valem para gerar e refinar, e ficam persistidos.
+
+### Q-5. O `/regerar` só existia na página de projeto
+
+O endpoint de refino existe desde o início, mas o fluxo principal não o usava: para ajustar um prompt gerado na home, só recomeçando o pipeline do zero.
+
+**Feito:** painel "Refinar este prompt" no resultado, com histórico de versões e restauração. Cada refino guarda a versão anterior com a instrução que a originou.
+
+### Q-6. As três funcionalidades inertes
+
+- **Arrastar para reordenar** agora funciona: `dragControls` ligado à alça, que faltava.
+- **O chat falso saiu.** No lugar entrou **Contexto do projeto** — um campo persistido, injetado em toda geração de sub-tarefa via `contextoProjeto`. Resolve um problema real: sub-tarefas do plano de divisão eram geradas isoladas e perdiam a stack e as convenções do projeto que as originou. O log de atividade, que era a parte útil do chat, ficou.
+- **Histórico por tarefa** agora aparece na tarefa expandida, com restaurar.
+
+### Q-7. Cancelar geração
+
+O backend passou a honrar `CancellationToken` na rodada 1, mas nada no frontend usava isso. Agora há botão de cancelar durante a geração, via `AbortController` — interrompe também as chamadas ao OpenRouter no backend.
+
+### Q-8. Barra de progresso deixou de mentir
+
+Continua sendo estimativa (o backend não reporta progresso), mas não afirma mais conclusão: sem ✓ e sem riscado nas etapas "passadas", com rótulo "estimativa" e o tempo real decorrido. Progresso medido de verdade exige streaming — segue no backlog.
+
+### Q-9. Defeito de layout na lista de tarefas
+
+Encontrado ao renderizar a página de projeto num navegador: cinco botões `shrink-0` numa coluna de 320px comiam a largura do texto, e o título quebrava letra a letra quando a tarefa era expandida. As ações passaram para dentro da coluna flexível e a barra lateral foi para 384px.
+
+### Também nesta rodada
+
+- Removidas as promessas vazias de "95%+ de força", que não significam nada operacionalmente para um modelo, substituídas por restrições concretas ("descreva o que se vê, não o que se sente"; "prefira números, nomes de arquivo e comandos a adjetivos").
+- Contraste elevado nos textos auxiliares: os `text-zinc-700` sobre `#030712` (~2:1) viraram `text-zinc-500`/`400`.
+- `⌘/Ctrl + Enter` gera o prompt.
+
+---
+
 ## P2 — Pendentes (backlog)
 
 Ordenados por retorno sobre esforço.
@@ -239,23 +309,11 @@ Sem `.github/workflows/`. Lint, typecheck e build do frontend passam hoje e não
 
 Os defaults incluem `google/gemini-2.0-flash-exp:free` e `arcee-ai/trinity-large-preview:free` — modelos de preview cuja disponibilidade no OpenRouter é volátil. Não alterei os ids, porque não consigo consultar o catálogo do OpenRouter daqui e chutar id de modelo seria pior que manter o atual. Agora são configuráveis, e `GET /api/modelos/testar` confirma quais respondem. **Rodar esse endpoint é o primeiro passo recomendado.**
 
-### 5. Três funcionalidades da UI são inertes
+### 5. Progresso real do pipeline
 
-- **Arrastar para reordenar:** `<Reorder.Item dragListener={false}>` sem nenhum `dragControls` — o ícone `GripVertical` tem `cursor-grab` mas não arrasta nada.
-- **Chat do projeto:** responde com um texto fixo por `setTimeout`; o botão de enviar nem isso faz. Não há backend de chat.
-- **Histórico por tarefa:** `historico` é gravado a cada regeração e **nunca renderizado** — cresce no `localStorage` sem ninguém ver.
+Resolvido pela metade na rodada 2: o indicador não afirma mais conclusão e mostra o tempo decorrido, mas continua sendo estimativa. Progresso medido exige o backend transmitir cada etapa — SSE em `/api/prompt/gerar` seria a forma natural, e daria de brinde resultados parciais em vez do bloco tudo-ou-nada de hoje.
 
-Cada uma é "ligar ou remover". Deixá-las como estão custa confiança do usuário.
-
-### 6. Barra de progresso é decorativa
-
-`setInterval(..., 4000)` avança pelos 7 estágios independentemente do que o backend está fazendo. Em pipeline rápido ela mente para menos; em lento, trava no último estágio. Streaming de progresso via SSE seria o correto; enquanto isso, um spinner honesto mente menos.
-
-### 7. Etapa de validação é cara e frágil por desenho
-
-`ValidarPorTipo` manda o prompt inteiro para outro modelo e pede que ele **copie o prompt de volta** dentro de `<prompt_final>`. Isso dobra o custo de tokens da etapa mais pesada e cria a maior superfície de truncamento do pipeline, para no caso feliz devolver o texto que já tínhamos. Pedir só o diagnóstico (`problemas_encontrados` + `score`) e aplicar correções localmente seria mais barato e mais robusto.
-
-### 8. Concentração de responsabilidade
+### 6. Concentração de responsabilidade
 
 `PromptController.cs` (~900 linhas) ainda acumula validação, orquestração, prompts, integração HTTP e formatação de resposta. `page.tsx` (~1000 linhas) acumula duas páginas inteiras, cliente HTTP, persistência e apresentação. Isto é exatamente o que os backlogs #5, #6 e #7 endereçam — e o [ADR-001](../architecture/adr-001-modular-monolith-first.md) pede que seja feito em fatias revisáveis, não num rewrite. Por isso não foi tocado aqui.
 
@@ -275,4 +333,4 @@ Cada uma é "ligar ou remover". Deixá-las como estão custa confiança do usuá
 2. Rodar `GET /api/modelos/testar` e trocar, na configuração, os modelos que estiverem fora.
 3. Abrir o backlog #3 (fundação de testes) usando os helpers `internal static` já preparados.
 4. Abrir o backlog #8 (CI) com `npm run check` + `dotnet build`.
-5. Decidir sobre as três funcionalidades inertes: ligar ou remover.
+5. Avaliar streaming (SSE) na rota de geração, que resolve progresso real e resultado parcial de uma vez.

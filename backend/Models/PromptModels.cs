@@ -12,8 +12,104 @@ public enum TipoObjetivo
     Outro          // IA detecta e especializa
 }
 
+// ── NÍVEL DE DETALHE ─────────────────────────────────────────────────────────
+/// <summary>
+/// Quanto o prompt gerado deve se estender. Controla tanto a diretriz passada ao
+/// modelo quanto o orçamento de tokens da etapa de geração.
+/// </summary>
+public enum NivelDetalhe
+{
+    Conciso,      // o essencial, sem redundância
+    Equilibrado,  // padrão
+    Exaustivo     // cobre casos de borda e contexto amplo
+}
+
+public static class NiveisDetalhe
+{
+    public static string Diretriz(NivelDetalhe nivel) => nivel switch
+    {
+        NivelDetalhe.Conciso => """
+            NÍVEL DE DETALHE: conciso.
+            Entregue o menor prompt que ainda cumpre todos os critérios.
+            Corte contexto explicativo, repetição e seções que não mudam o resultado.
+            Prefira uma linha densa a três linhas vagas.
+            """,
+
+        NivelDetalhe.Exaustivo => """
+            NÍVEL DE DETALHE: exaustivo.
+            Cubra casos de borda, entradas inválidas e cenários de falha.
+            Inclua exemplos concretos e contexto suficiente para alguém sem
+            familiaridade com o domínio executar sem perguntar nada.
+            Detalhamento é bem-vindo, desde que cada linha acrescente informação.
+            """,
+
+        _ => """
+            NÍVEL DE DETALHE: equilibrado.
+            Cubra o caminho principal e os riscos mais prováveis.
+            Detalhe o que muda o resultado e corte o resto.
+            """
+    };
+
+    /// <summary>Orçamento de tokens da geração, proporcional ao nível pedido.</summary>
+    public static int MaxTokens(NivelDetalhe nivel, int baseMaxTokens) => nivel switch
+    {
+        NivelDetalhe.Conciso   => Math.Max(1024, baseMaxTokens / 2),
+        NivelDetalhe.Exaustivo => baseMaxTokens * 2,
+        _                      => baseMaxTokens
+    };
+}
+
+// ── IDIOMA DE SAÍDA ──────────────────────────────────────────────────────────
+public static class IdiomasSaida
+{
+    public const string Automatico = "auto";
+
+    private static readonly Dictionary<string, string> Nomes =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["pt-BR"] = "português do Brasil",
+            ["en"]    = "inglês",
+            ["es"]    = "espanhol",
+        };
+
+    /// <summary>
+    /// Diretriz de idioma. "auto" (padrão) deixa o modelo seguir o idioma da
+    /// ideia — importante porque o executor final costuma ser anglófono, mas o
+    /// usuário escreve em português.
+    /// </summary>
+    public static string Diretriz(string? idioma)
+    {
+        if (string.IsNullOrWhiteSpace(idioma) || string.Equals(idioma, Automatico, StringComparison.OrdinalIgnoreCase))
+            return "IDIOMA: escreva o prompt no mesmo idioma da ideia do usuário.";
+
+        return Nomes.TryGetValue(idioma.Trim(), out var nome)
+            ? $"IDIOMA: escreva TODO o prompt gerado em {nome}, independentemente do idioma da ideia do usuário."
+            : $"IDIOMA: escreva TODO o prompt gerado em {idioma.Trim()}, independentemente do idioma da ideia do usuário.";
+    }
+}
+
 // ── REQUESTS ─────────────────────────────────────────────────────────────────
-public class PromptRequest
+/// <summary>Preferências de saída compartilhadas entre gerar e regerar.</summary>
+public class PreferenciasSaida
+{
+    /// <summary>Quanto o prompt deve se estender. Null = Equilibrado.</summary>
+    public NivelDetalhe? NivelDetalhe { get; set; }
+
+    /// <summary>"auto" (padrão), "pt-BR", "en", "es" ou qualquer rótulo livre.</summary>
+    public string? IdiomaSaida { get; set; }
+
+    /// <summary>
+    /// Executor do prompt: "Claude Code", "Google Jules", "OpenHands", "Cursor"...
+    /// Resolvido em <see cref="ExecutorPerfis"/> para diretrizes concretas.
+    /// </summary>
+    public string? ExecutorAlvo { get; set; }
+
+    // O nome da propriedade colide com o nome do tipo, então o default vai
+    // qualificado para não depender de resolução ambígua.
+    public NivelDetalhe NivelOuPadrao => NivelDetalhe ?? ApiAssistente.Models.NivelDetalhe.Equilibrado;
+}
+
+public class PromptRequest : PreferenciasSaida
 {
     public string     IdeiaBruta              { get; set; } = string.Empty;
     public string?    Papel                   { get; set; }
@@ -23,12 +119,15 @@ public class PromptRequest
     // Tipo sugerido pelo usuário (null = IA detecta)
     public TipoObjetivo? TipoSugerido         { get; set; }
 
-    // Executor do prompt: "Claude Code", "Google Jules", "OpenHands", "Cursor", etc.
-    // Usado para otimizar estrutura e verbosidade do prompt gerado
-    public string?       ExecutorAlvo         { get; set; }
+    /// <summary>
+    /// Contexto compartilhado do projeto (stack, convenções, restrições), aplicado
+    /// a todas as sub-tarefas. Sem isso, cada sub-tarefa do plano de divisão era
+    /// gerada isolada e perdia o contexto do projeto que a originou.
+    /// </summary>
+    public string?    ContextoProjeto         { get; set; }
 }
 
-public class RegerarRequest
+public class RegerarRequest : PreferenciasSaida
 {
     public string        PromptAtual          { get; set; } = string.Empty;
     public string        InstrucaoMelhora     { get; set; } = string.Empty;

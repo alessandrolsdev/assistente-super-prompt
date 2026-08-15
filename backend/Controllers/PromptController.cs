@@ -71,8 +71,10 @@ public class PromptController : ControllerBase
             }
 
             // -- Enriquece ideia -----------------------------------------------
+            // O executor deixou de entrar aqui como nota solta: virou diretriz
+            // estruturada na etapa de geração (ver ExecutorPerfis).
             var ideiaEnriquecida = MontarIdeiaEnriquecida(
-                request.IdeiaBruta, request.RespostasClarificacao, request.ExecutorAlvo);
+                request.IdeiaBruta, request.RespostasClarificacao, request.ContextoProjeto);
 
             // -- TRIAGEM (só para código/refatoração/UI/outro) -----------------
             var tipoExigeTriagem = tipoFinal is TipoObjetivo.Codigo
@@ -112,7 +114,8 @@ public class PromptController : ControllerBase
 
             // -- ETAPA 2: GERAÇÃO ----------------------------------------------
             var geracao = await GerarPorTipo(
-                ideiaEnriquecida, tipoFinal, analise.Texto!, deteccao.papel, deteccao.formato, config, cancellationToken);
+                ideiaEnriquecida, tipoFinal, analise.Texto!, deteccao.papel, deteccao.formato,
+                config, request, cancellationToken);
             var modeloGeracaoUsado = geracao.ModeloUsado ?? Modelos.Geracao;
 
             if (!geracao.Sucesso)
@@ -129,20 +132,12 @@ public class PromptController : ControllerBase
             var validacao = await ValidarPorTipo(promptGerado, tipoFinal, config, cancellationToken);
             var textoValidacao = validacao.Texto ?? "";
 
-            var promptFinal = ExtrairTagXmlRobusto(textoValidacao, "prompt_final");
             var tamanhoMinimo = tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video ? 50 : 80;
-            var promptFinalValido = promptFinal is not null
-                && promptFinal.Length > tamanhoMinimo
-                && !promptFinal.StartsWith("Nenhum", StringComparison.OrdinalIgnoreCase)
-                && !promptFinal.StartsWith("Corrija", StringComparison.OrdinalIgnoreCase);
-
             var tagGeracao = tipoFinal is TipoObjetivo.Imagem or TipoObjetivo.Video
                 ? "prompt_gerado"
                 : "prompt_otimizado";
 
-            var resultadoFinal = promptFinalValido
-                ? promptFinal!
-                : ExtrairTagXmlRobusto(promptGerado, tagGeracao) ?? promptGerado;
+            var resultadoFinal = ResolverPromptFinal(promptGerado, tagGeracao, textoValidacao, tamanhoMinimo);
 
             if (string.IsNullOrWhiteSpace(resultadoFinal))
             {
@@ -226,24 +221,35 @@ public class PromptController : ControllerBase
                 _ => $"Aplique: {request.InstrucaoMelhora}"
             };
 
+            var perfil = ExecutorPerfis.Get(request.ExecutorAlvo);
+            var nivel  = request.NivelOuPadrao;
+
             var melhoria = await ChamarCadeiaGeracao(
                 temperature: config.Temperature,
                 systemPrompt: $@"
 Você é um Arquiteto de Prompts especializado em {tipo}.
-NUNCA descarte a estrutura existente.
-SEMPRE aplique a instrução de melhora cirurgicamente.
-SEMPRE mantenha 95%+ de força para: {config.FerramentasAlvo}.",
+NUNCA descarte a estrutura existente do prompt.
+NUNCA encurte partes que a instrução de melhora não pediu para mudar.
+SEMPRE aplique a instrução cirurgicamente: o resto do prompt deve sair intacto.
+SEMPRE devolva o prompt COMPLETO, não um diff nem um resumo do que mudou.",
                 userPrompt: $@"
 Prompt atual:
 {request.PromptAtual}
 
-Instrução: {instrucao}
+Instrução de melhora: {instrucao}
 Papel: {request.Papel ?? config.PapelPadrao}
 
-Retorne SOMENTE dentro das tags:
+{perfil.ParaPrompt()}
+
+{NiveisDetalhe.Diretriz(nivel)}
+
+{IdiomasSaida.Diretriz(request.IdiomaSaida)}
+
+Retorne SOMENTE dentro das tags, com o prompt inteiro já melhorado:
 <prompt_melhorado>
-[prompt completo melhorado]
+...prompt completo aqui...
 </prompt_melhorado>",
+                maxTokens: NiveisDetalhe.MaxTokens(nivel, _options.MaxTokens),
                 cancellationToken: cancellationToken);
 
             if (!melhoria.Sucesso)
@@ -258,20 +264,13 @@ Retorne SOMENTE dentro das tags:
             var validacao = await ValidarPorTipo(promptMelhorado, tipo, config, cancellationToken);
             var textoValidacao = validacao.Texto ?? "";
 
-            var final = ExtrairTagXmlRobusto(textoValidacao, "prompt_final");
-            var finalValido = final is not null
-                && final.Length > 80
-                && !final.StartsWith("Nenhum", StringComparison.OrdinalIgnoreCase)
-                && !final.StartsWith("Corrija", StringComparison.OrdinalIgnoreCase);
-
-            if (!finalValido)
-                final = ExtrairTagXmlRobusto(promptMelhorado, "prompt_melhorado") ?? promptMelhorado;
+            var final = ResolverPromptFinal(promptMelhorado, "prompt_melhorado", textoValidacao, 80);
 
             return Ok(new
             {
                 tipo_resposta    = "prompt_melhorado",
                 tipo_objetivo    = tipo.ToString(),
-                prompt_otimizado = final!.Trim(),
+                prompt_otimizado = final.Trim(),
                 pipeline = new
                 {
                     etapa_1 = new { modelo = modeloUsado,      funcao = "Geração"   },
@@ -382,10 +381,13 @@ Pedido: {ideia}",
     // GERAÇÃO ESPECIALIZADA POR TIPO
     // ------------------------------------------------------------
     private async Task<RespostaModelo> GerarPorTipo(
-        string ideia, TipoObjetivo tipo, string analise,
-        string papel, string formato, ObjetivoConfig config, CancellationToken cancellationToken)
+        string ideia, TipoObjetivo tipo, string analise, string papel, string formato,
+        ObjetivoConfig config, PreferenciasSaida preferencias, CancellationToken cancellationToken)
     {
-        var criterios = string.Join("\n    ", config.CriteriosBase.Select((c, i) => $"{i + 1}. {c}"));
+        var criterios  = string.Join("\n    ", config.CriteriosBase.Select((c, i) => $"{i + 1}. {c}"));
+        var nivel      = preferencias.NivelOuPadrao;
+        var diretrizes = $"{NiveisDetalhe.Diretriz(nivel)}\n\n{IdiomasSaida.Diretriz(preferencias.IdiomaSaida)}";
+        var maxTokens  = NiveisDetalhe.MaxTokens(nivel, _options.MaxTokens);
 
         // Imagem e vídeo: texto direto, sem XML
         if (tipo is TipoObjetivo.Imagem or TipoObjetivo.Video)
@@ -394,10 +396,11 @@ Pedido: {ideia}",
                 temperature: config.Temperature,
                 systemPrompt: $@"
 Você é especialista em prompt engineering para {tipo} ({config.FerramentasAlvo}).
-NUNCA use XML no prompt gerado.
-NUNCA adicione explicações — apenas o prompt.
-SEMPRE inclua parâmetros técnicos da ferramenta no final.
-SEMPRE extraia 95%+ do potencial da IA geradora.",
+NUNCA use XML dentro do prompt gerado.
+NUNCA adicione explicações, comentários ou preâmbulo — apenas o prompt.
+SEMPRE inclua os parâmetros técnicos da ferramenta no final.
+SEMPRE descreva o que se vê, não o que se sente: substitua adjetivos vagos
+(""bonito"", ""impactante"") por atributos observáveis (material, cor, lente, ângulo).",
                 userPrompt: $@"
 Com base na análise:
 {analise}
@@ -407,24 +410,42 @@ Crie o prompt para:
 - Ferramenta: {config.FerramentasAlvo}
 - Papel: {papel}
 
+{diretrizes}
+
 Critérios obrigatórios:
 {criterios}
 
-Retorne SOMENTE dentro das tags:
+Retorne SOMENTE dentro das tags, com o prompt já pronto para colar na ferramenta:
 <prompt_gerado>
-[prompt completo — para Midjourney inclua --ar, --v, --style no final]
+...prompt completo aqui — para Midjourney inclua --ar, --v, --style no final...
 </prompt_gerado>",
+                maxTokens: maxTokens,
                 cancellationToken: cancellationToken);
         }
+
+        var perfil = ExecutorPerfis.Get(preferencias.ExecutorAlvo);
 
         // Outros: XML estruturado
         return await ChamarCadeiaGeracao(
             temperature: config.Temperature,
             systemPrompt: $@"
 Você é um Arquiteto de Prompts Sênior para {tipo}.
+
+REGRA CRÍTICA DE PREENCHIMENTO:
+O XML abaixo é um GABARITO. O texto entre colchetes descreve o que VOCÊ deve
+escrever naquela posição — é instrução para você, nunca conteúdo de saída.
+Substitua cada colchete pelo conteúdo real e específico desta tarefa.
+Um gabarito devolvido com os colchetes intactos é uma resposta INVÁLIDA.
+
+Exemplo do erro a evitar:
+  ERRADO:  <instrucao_principal>[Tarefa única com critério mensurável]</instrucao_principal>
+  ERRADO:  <instrucao_principal>Tarefa única com critério de sucesso mensurável.</instrucao_principal>
+  CORRETO: <instrucao_principal>Implemente o endpoint POST /pedidos que persiste o
+           pedido e devolve 201 com o Location do recurso criado.</instrucao_principal>
+
 NUNCA adicione texto fora das tags XML.
-NUNCA seja genérico.
-SEMPRE inclua critérios mensuráveis.",
+NUNCA use frases genéricas que serviriam para qualquer outra tarefa.
+SEMPRE prefira números, nomes de arquivo, versões e comandos a adjetivos.",
             userPrompt: $@"
 Com base na análise:
 {analise}
@@ -432,22 +453,26 @@ Com base na análise:
 Gere o prompt para:
 - Papel: {papel}
 - Objetivo: {ideia}
-- Ferramenta: {config.FerramentasAlvo}
 - Formato: {formato}
 
-Critérios obrigatórios:
+{perfil.ParaPrompt()}
+
+{diretrizes}
+
+Critérios obrigatórios a contemplar:
 {criterios}
 
-Retorne SOMENTE neste XML:
+Preencha este gabarito e retorne SOMENTE ele:
 <prompt_otimizado>
-  <system_instruction>{papel}. Ferramenta: {config.FerramentasAlvo}.</system_instruction>
-  <restricoes_constitucionais>6 restrições NUNCA/SEMPRE específicas para {tipo}.</restricoes_constitucionais>
-  <instrucao_principal>Tarefa única com critério de sucesso mensurável.</instrucao_principal>
-  <criterios_de_aceitacao>{criterios}</criterios_de_aceitacao>
-  <few_shot_exemplo>INPUT: exemplo realista | REASONING: raciocínio | OUTPUT: resultado correto</few_shot_exemplo>
-  <formato_resposta>{formato}</formato_resposta>
-  <loop_validacao>Verifique os {config.CriteriosBase.Length} critérios antes de entregar.</loop_validacao>
+  <system_instruction>[papel do executor + stack e versões concretas desta tarefa]</system_instruction>
+  <restricoes_constitucionais>[6 regras NUNCA/SEMPRE derivadas das armadilhas reais desta tarefa, uma por linha]</restricoes_constitucionais>
+  <instrucao_principal>[a tarefa em si, com o critério de sucesso mensurável embutido]</instrucao_principal>
+  <criterios_de_aceitacao>[os critérios acima reescritos como verificações objetivas desta tarefa]</criterios_de_aceitacao>
+  <few_shot_exemplo>[um exemplo concreto: INPUT real | RACIOCÍNIO | OUTPUT correto]</few_shot_exemplo>
+  <formato_resposta>[como o executor deve estruturar a entrega]</formato_resposta>
+  <loop_validacao>[o que o executor confere antes de entregar]</loop_validacao>
 </prompt_otimizado>",
+            maxTokens: maxTokens,
             cancellationToken: cancellationToken);
     }
 
@@ -488,23 +513,60 @@ Retorne SOMENTE neste XML:
         return await ChamarModelo(
             modelo: Modelos.Validacao, temperature: 0.1,
             systemPrompt: $@"
-Você valida prompts para {tipo} ({config.FerramentasAlvo}).
+Você audita prompts para {tipo} ({config.FerramentasAlvo}).
 Prompts ricos e detalhados são CORRETOS — não penalize detalhamento.
-Penalize apenas genericidade e falta de especificidade.
+Penalize genericidade, vaguidade e gabarito não preenchido.
+Trate como problema GRAVE qualquer texto que descreva o que deveria estar ali
+em vez de estar preenchido (ex.: ""6 restrições específicas"", ""exemplo realista"").
 SEMPRE responda dentro das tags XML.",
             userPrompt: $@"
-Valide este prompt para {tipo}:
+Audite este prompt para {tipo}.
+
+Preencha o gabarito abaixo. Só reescreva o prompt inteiro se houver problema real:
+quando não houver, deixe <prompt_final> VAZIO — o prompt original será mantido.
+Reescrever um prompt que já está bom só arrisca perder conteúdo.
 
 <validacao>
   <checklist>{checklist}</checklist>
-  <problemas_encontrados>Problemas reais. Se nenhum: Nenhum problema crítico encontrado.</problemas_encontrados>
-  <prompt_final>Corrija problemas reais. Se tudo ok: copie sem alterações.</prompt_final>
-  <score>0-100. Prompts ricos e específicos devem pontuar 85+.</score>
+  <problemas_encontrados>[problemas reais e específicos, ou ""Nenhum problema crítico encontrado""]</problemas_encontrados>
+  <precisa_correcao>sim/não</precisa_correcao>
+  <prompt_final>[APENAS se precisa_correcao=sim: o prompt completo corrigido. Caso contrário deixe vazio.]</prompt_final>
+  <score>[0-100. Prompts ricos e específicos devem pontuar 85+.]</score>
 </validacao>
 
-Prompt:
+Prompt auditado:
 {promptGerado}",
             cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Decide entre o prompt da etapa de geração e a reescrita da validação.
+    ///
+    /// A validação agora só reescreve quando aponta problema real — antes ela era
+    /// obrigada a copiar o prompt inteiro de volta, o que dobrava o custo em
+    /// tokens da etapa mais pesada e era a principal fonte de truncamento.
+    /// </summary>
+    private static string ResolverPromptFinal(
+        string promptGerado, string tagGeracao, string textoValidacao, int tamanhoMinimo)
+    {
+        var precisaCorrecao = string.Equals(
+            ExtrairTagXml(textoValidacao, "precisa_correcao")?.Trim(), "sim", StringComparison.OrdinalIgnoreCase);
+
+        var original = ExtrairTagXmlRobusto(promptGerado, tagGeracao) ?? promptGerado;
+
+        if (!precisaCorrecao) return original;
+
+        var corrigido = ExtrairTagXmlRobusto(textoValidacao, "prompt_final");
+
+        // Uma "correção" curta demais, ou que devolveu a instrução do gabarito em
+        // vez do prompt, é descartada em favor do original.
+        var corrigidoValido = corrigido is not null
+            && corrigido.Length > tamanhoMinimo
+            && !corrigido.StartsWith("Nenhum", StringComparison.OrdinalIgnoreCase)
+            && !corrigido.StartsWith("Corrija", StringComparison.OrdinalIgnoreCase)
+            && !corrigido.StartsWith("APENAS se", StringComparison.OrdinalIgnoreCase);
+
+        return corrigidoValido ? corrigido! : original;
     }
 
     // ------------------------------------------------------------
@@ -709,12 +771,12 @@ Tarefa: '{ideia}'",
     // HELPERS
     // ------------------------------------------------------------
     internal static string MontarIdeiaEnriquecida(
-        string ideia, Dictionary<string, string>? respostas, string? executor = null)
+        string ideia, Dictionary<string, string>? respostas, string? contextoProjeto = null)
     {
         var sb = new StringBuilder(ideia);
 
-        if (!string.IsNullOrWhiteSpace(executor))
-            sb.Append($"\n\n[EXECUTOR DO PROMPT: {executor} — otimize a estrutura, verbosidade e formato do prompt especificamente para este assistente de código.]");
+        if (!string.IsNullOrWhiteSpace(contextoProjeto))
+            sb.Append($"\n\n[CONTEXTO DO PROJETO (vale para todas as tarefas):\n{contextoProjeto.Trim()}]");
 
         if (respostas?.Count > 0)
         {
@@ -730,8 +792,8 @@ Tarefa: '{ideia}'",
     /// <summary>Chama um único modelo, sem cadeia de fallback.</summary>
     private Task<RespostaModelo> ChamarModelo(
         string modelo, double temperature, string systemPrompt, string userPrompt,
-        CancellationToken cancellationToken) =>
-        ChamarComFallback(new[] { modelo }, temperature, systemPrompt, userPrompt, cancellationToken);
+        CancellationToken cancellationToken, int? maxTokens = null) =>
+        ChamarComFallback(new[] { modelo }, temperature, systemPrompt, userPrompt, maxTokens, cancellationToken);
 
     /// <summary>
     /// Chama a cadeia de geração, caindo para o próximo modelo quando o anterior
@@ -741,12 +803,12 @@ Tarefa: '{ideia}'",
     /// </summary>
     private Task<RespostaModelo> ChamarCadeiaGeracao(
         double temperature, string systemPrompt, string userPrompt,
-        CancellationToken cancellationToken) =>
-        ChamarComFallback(Modelos.GeracaoFallback, temperature, systemPrompt, userPrompt, cancellationToken);
+        CancellationToken cancellationToken, int? maxTokens = null) =>
+        ChamarComFallback(Modelos.GeracaoFallback, temperature, systemPrompt, userPrompt, maxTokens, cancellationToken);
 
     private async Task<RespostaModelo> ChamarComFallback(
         IReadOnlyList<string> modelos, double temperature, string systemPrompt, string userPrompt,
-        CancellationToken cancellationToken)
+        int? maxTokens, CancellationToken cancellationToken)
     {
         string? ultimoErro = null;
         HttpStatusCode? ultimoStatus = null;
@@ -757,7 +819,7 @@ Tarefa: '{ideia}'",
 
             try
             {
-                var (texto, modeloUsado) = await ChamarModeloSingle(modelo, temperature, systemPrompt, userPrompt, cancellationToken);
+                var (texto, modeloUsado) = await ChamarModeloSingle(modelo, temperature, systemPrompt, userPrompt, maxTokens, cancellationToken);
                 if (!string.IsNullOrWhiteSpace(texto))
                     return RespostaModelo.Ok(texto, modeloUsado ?? modelo);
 
@@ -793,13 +855,13 @@ Tarefa: '{ideia}'",
 
     private async Task<(string? texto, string? modeloUsado)> ChamarModeloSingle(
         string modelo, double temperature, string systemPrompt, string userPrompt,
-        CancellationToken cancellationToken)
+        int? maxTokens, CancellationToken cancellationToken)
     {
         var payload = new
         {
             model = modelo,
             temperature,
-            max_tokens = _options.MaxTokens,
+            max_tokens = maxTokens ?? _options.MaxTokens,
             messages = new[]
             {
                 new { role = "system", content = systemPrompt.Trim() },
