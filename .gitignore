@@ -32,7 +32,7 @@ frontend/.vercel
 frontend/*.tsbuildinfo
 frontend/next-env.d.ts
 
-# Vari?veis de ambiente
+# Variaveis de ambiente
 frontend/.env
 frontend/.env.*
 frontend/.env*.local
@@ -41,36 +41,47 @@ frontend/.env*.local
 # =========================
 # .NET / C# (Backend)
 # =========================
-# Pastas de compila??o (Arquivos bin?rios pesados)
+# Pastas de compilacao (binarios pesados) — inclui os projetos de teste
 backend/**/bin/
 backend/**/obj/
+backend/TestResults/
 backend/**/TestResults/
 
-# Arquivo de configura??o sens?vel local
+# Arquivo de configuracao sensivel local
 backend/appsettings.Development.json
 backend/appsettings.*.json
 !backend/appsettings.Example.json
 
-# Arquivos de cache e usu?rio do Visual Studio / VS Code
+# Arquivos de cache e usuario do Visual Studio / VS Code
 *.user
 *.suo
 .vscode/
 
 # =========================
-# Documentos de trabalho
+# Documentos de trabalho (ver AGENTS.md)
 # =========================
-# Auditorias, relatorios e anotacoes descrevem um momento: ficam obsoletos
-# rapido e nao pertencem ao historico. O que precisa sobreviver a eles vira
-# issue, ADR ou teste de regressao.
+# Auditorias, relatorios, analises e anotacoes descrevem um momento: ficam
+# obsoletos rapido e nao pertencem ao historico do repositorio. O que precisa
+# sobreviver a eles vira issue, ADR ou teste de regressao.
 docs/audit/
 docs/notes/
 .notes/
 scratch/
+tmp/
 *.local.md
 AUDITORIA*.md
+AUDIT*.md
 RELATORIO*.md
 ANALISE*.md
 NOTES.md
+SCRATCH.md
+TODO.local.md
+
+# Documentacao que E contrato do projeto continua versionada
+!README.md
+!AGENTS.md
+!CONTRIBUTING.md
+!docs/architecture/
 
 # =========================
 # OS / Geral

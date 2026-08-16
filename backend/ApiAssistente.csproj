@@ -8,14 +8,25 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="ApiAssistente.Tests\**\*.cs" />
-    <EmbeddedResource Remove="ApiAssistente.Tests\**\*" />
+    <!-- O projeto de teste vive em backend/ApiAssistente.Tests/, dentro da
+         pasta deste projeto. Sem esta exclusao o glob padrao do SDK (**/*.cs)
+         puxaria os arquivos de teste para ca e a compilacao quebraria por nao
+         conhecer o xUnit. -->
+    <Compile Remove="ApiAssistente.Tests\**\*" />
+    <Content Remove="ApiAssistente.Tests\**\*" />
     <None Remove="ApiAssistente.Tests\**\*" />
+    <EmbeddedResource Remove="ApiAssistente.Tests\**\*" />
   </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.24" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
 
-</Project>
+  <ItemGroup>
+    <!-- Os helpers puros de parsing e normalizacao sao `internal static` para
+         ficarem testaveis sem subir o servidor. -->
+    <InternalsVisibleTo Include="ApiAssistente.Tests" />
+  </ItemGroup>
 
+</Project>

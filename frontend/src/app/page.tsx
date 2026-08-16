@@ -1,20 +1,38 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { motion, AnimatePresence, Reorder } from "framer-motion";
+import { motion, AnimatePresence, Reorder, useDragControls } from "framer-motion";
 import {
-  ArrowRight, CheckCircle2, Copy, Check, Pencil, Cpu, Zap, Shield,
-  AlertTriangle, Clock, Download, Sparkles, RotateCcw, FileText,
+  ArrowRight, CheckCircle2, Copy, Check, Pencil, Zap, Shield,
+  AlertTriangle, Clock, Download, Sparkles, FileText, RotateCcw,
   GripVertical, Trash2, RefreshCw, MessageSquare, Send, FolderOpen,
   Image as ImageIcon, Film, Code2, GitBranch, PenTool, Layout,
-  HelpCircle, X, ChevronDown, ChevronUp, ChevronRight
+  HelpCircle, X, ChevronDown, ChevronUp
 } from "lucide-react";
+import { postApi, foiCancelado, mensagemDeErro } from "@/lib/api";
+import { salvarLocal, lerLocal } from "@/lib/storage";
+import { baixarTexto, nomeDeArquivo, copiar, lerScore, corDoScore, offsetDoScore } from "@/lib/format";
 
 // ─────────────────────────────────────────────────────────────
 // TIPOS
 // ─────────────────────────────────────────────────────────────
 type AppState = "home" | "clarificando" | "projeto";
 type TipoObjetivo = "Imagem" | "Video" | "Codigo" | "Refatoracao" | "Copywriting" | "DesignUI" | "Outro";
+type NivelDetalhe = "Conciso" | "Equilibrado" | "Exaustivo";
+
+/** Preferências de saída enviadas ao backend em gerar e regerar. */
+interface Preferencias {
+  nivelDetalhe: NivelDetalhe;
+  idiomaSaida: string;
+  executorAlvo: string;
+}
+
+/** Versão anterior de um prompt, guardada a cada refino. */
+interface VersaoPrompt {
+  prompt: string;
+  score: string;
+  instrucao: string;
+}
 
 interface ObjetivoMeta {
   label: string;
@@ -49,7 +67,7 @@ interface TarefaQueue {
   score?: string;
   papel?: string;
   tipo?: TipoObjetivo;
-  historico?: { prompt: string; score: string; instrucao: string }[];
+  historico?: VersaoPrompt[];
 }
 
 interface PromptResult {
@@ -98,11 +116,18 @@ const OBJETIVOS: Record<TipoObjetivo, ObjetivoMeta> = {
 };
 
 const CHARS = "01アイウエカキ∆∑∏∫≈≠∞";
-const API   = "http://localhost:5117/api/prompt";
-const LS_KEY_QUEUE   = "pa_queue_v8";
-const LS_KEY_PROJETO = "pa_projeto_v8";
-const LS_KEY_RESULTADO = "pa_resultado_v8";
 
+// A URL base vem do ambiente (ver frontend/.env.example); o localhost fica
+// apenas como padrão de desenvolvimento.
+const LS_KEY_QUEUE     = "pa_queue_v8";
+const LS_KEY_PROJETO   = "pa_projeto_v8";
+const LS_KEY_RESULTADO = "pa_resultado_v8";
+const LS_KEY_PREFS     = "pa_prefs_v1";
+const LS_KEY_CONTEXTO  = "pa_contexto_v1";
+
+const PREFS_PADRAO: Preferencias = { nivelDetalhe: "Equilibrado", idiomaSaida: "auto", executorAlvo: "" };
+
+/** Roteiro das etapas do pipeline, exibido durante a geração (estimativa). */
 const STAGES = [
   { label: "Classificando objetivo",       color: "text-pink-400",   bg: "bg-pink-500/10",   border: "border-pink-500/20"   },
   { label: "Verificando ambiguidades",     color: "text-rose-400",   bg: "bg-rose-500/10",   border: "border-rose-500/20"   },
@@ -111,6 +136,34 @@ const STAGES = [
   { label: "Análise especializada",        color: "text-blue-400",   bg: "bg-blue-500/10",   border: "border-blue-500/20"   },
   { label: "Gerando super prompt",         color: "text-lime-400",   bg: "bg-lime-500/10",   border: "border-lime-500/20"   },
   { label: "Validando e calculando score", color: "text-purple-400", bg: "bg-purple-500/10", border: "border-purple-500/20" },
+];
+
+// ─────────────────────────────────────────────────────────────
+// PREFERÊNCIAS DE SAÍDA
+// ─────────────────────────────────────────────────────────────
+const NIVEIS: { id: NivelDetalhe; label: string; desc: string }[] = [
+  { id: "Conciso",     label: "Conciso",     desc: "O essencial, sem repetição" },
+  { id: "Equilibrado", label: "Equilibrado", desc: "Caminho principal e riscos prováveis" },
+  { id: "Exaustivo",   label: "Exaustivo",   desc: "Casos de borda e contexto amplo" },
+];
+
+const IDIOMAS: { id: string; label: string }[] = [
+  { id: "auto",  label: "Como escrevi" },
+  { id: "pt-BR", label: "Português"    },
+  { id: "en",    label: "Inglês"       },
+];
+
+/**
+ * Executores conhecidos. Os ids batem com `ExecutorPerfis` no backend, que é
+ * quem define como o prompt é moldado para cada um; aqui ficam só os rótulos.
+ */
+const EXECUTORES: { id: string; label: string; icon: string; desc: string }[] = [
+  { id: "",             label: "Qualquer IA", icon: "✦", desc: "Prompt autocontido, sem supor acesso a arquivos ou terminal" },
+  { id: "Claude Code",  label: "Claude Code", icon: "◆", desc: "Agente de terminal: objetivo e critérios verificáveis, não passo a passo" },
+  { id: "Google Jules", label: "Jules",       icon: "◈", desc: "Agente assíncrono: especificação completa, sem espaço para perguntar" },
+  { id: "OpenHands",    label: "OpenHands",   icon: "◉", desc: "Agente autônomo: setup, verificação e condição de parada explícitos" },
+  { id: "Cursor",       label: "Cursor",      icon: "◎", desc: "Editor: escopo curto, arquivos nomeados, alteração como diff" },
+  { id: "Windsurf",     label: "Windsurf",    icon: "◍", desc: "Editor com indexação: plano antes das edições, escopo de arquivos" },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -186,6 +239,85 @@ function ObjetivoSelector({
 }
 
 // ─────────────────────────────────────────────────────────────
+// PREFERÊNCIAS DE SAÍDA
+// ─────────────────────────────────────────────────────────────
+function PreferenciasPanel({ prefs, onChange }: {
+  prefs: Preferencias;
+  onChange: (p: Preferencias) => void;
+}) {
+  const executor = EXECUTORES.find(e => e.id === prefs.executorAlvo) ?? EXECUTORES[0];
+
+  return (
+    <div className="p-4 rounded-2xl border border-zinc-800/80 bg-zinc-900/50 space-y-3">
+      {/* Executor */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="mono text-[10px] text-zinc-500 tracking-[0.2em] uppercase">Executor</span>
+          <span className="mono text-[10px] text-zinc-600">quem vai rodar este prompt</span>
+        </div>
+        <div className="grid grid-cols-3 gap-2">
+          {EXECUTORES.map(e => (
+            <button key={e.id} onClick={() => onChange({ ...prefs, executorAlvo: e.id })}
+              aria-pressed={prefs.executorAlvo === e.id} title={e.desc}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-bold transition-all ${
+                prefs.executorAlvo === e.id
+                  ? "border-lime-500/40 bg-lime-500/10 text-lime-400"
+                  : "border-zinc-800/60 bg-zinc-900/40 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700"
+              }`}>
+              <span className="text-[11px]">{e.icon}</span>{e.label}
+            </button>
+          ))}
+        </div>
+        <p className="mono text-[10px] text-zinc-500 leading-relaxed">{executor.desc}.</p>
+      </div>
+
+      <div className="h-px bg-zinc-800/60" />
+
+      {/* Nível de detalhe */}
+      <div className="space-y-2">
+        <span className="mono text-[10px] text-zinc-500 tracking-[0.2em] uppercase">Nível de detalhe</span>
+        <div className="grid grid-cols-3 gap-2">
+          {NIVEIS.map(n => (
+            <button key={n.id} onClick={() => onChange({ ...prefs, nivelDetalhe: n.id })}
+              aria-pressed={prefs.nivelDetalhe === n.id} title={n.desc}
+              className={`px-3 py-2 rounded-xl border text-xs font-bold transition-all ${
+                prefs.nivelDetalhe === n.id
+                  ? "border-lime-500/40 bg-lime-500/10 text-lime-400"
+                  : "border-zinc-800/60 bg-zinc-900/40 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700"
+              }`}>
+              {n.label}
+            </button>
+          ))}
+        </div>
+        <p className="mono text-[10px] text-zinc-500 leading-relaxed">
+          {NIVEIS.find(n => n.id === prefs.nivelDetalhe)?.desc}.
+        </p>
+      </div>
+
+      <div className="h-px bg-zinc-800/60" />
+
+      {/* Idioma */}
+      <div className="flex items-center gap-3">
+        <span className="mono text-[10px] text-zinc-500 tracking-[0.2em] uppercase shrink-0">Idioma</span>
+        <div className="flex gap-2 ml-auto">
+          {IDIOMAS.map(i => (
+            <button key={i.id} onClick={() => onChange({ ...prefs, idiomaSaida: i.id })}
+              aria-pressed={prefs.idiomaSaida === i.id}
+              className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-all ${
+                prefs.idiomaSaida === i.id
+                  ? "border-lime-500/40 bg-lime-500/10 text-lime-400"
+                  : "border-zinc-800/60 bg-zinc-900/40 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700"
+              }`}>
+              {i.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // CLARIFICAÇÃO
 // ─────────────────────────────────────────────────────────────
 function ClarificacaoWidget({ perguntas, onResponder, onPular }: {
@@ -250,11 +382,13 @@ function ClarificacaoWidget({ perguntas, onResponder, onPular }: {
 // ─────────────────────────────────────────────────────────────
 // TODO ITEM (projeto)
 // ─────────────────────────────────────────────────────────────
-function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDeletar, onDownload, onGerar }: {
+function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDeletar, onDownload, onGerar, onDragStart, onRestaurar }: {
   tarefa: TarefaQueue; ativo: boolean; expanded: boolean;
   onToggle: () => void; onEditar: (t: string, d: string) => void;
   onRegerar: (i: string) => void; onDeletar: () => void;
   onDownload: () => void; onGerar: () => void;
+  onDragStart: (e: React.PointerEvent) => void;
+  onRestaurar: (indice: number) => void;
 }) {
   const [editando, setEditando]   = useState(false);
   const [tEdit, setTEdit]         = useState(tarefa.titulo);
@@ -270,7 +404,12 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
       ativo ? "border-lime-500/40 bg-lime-500/5" : done ? "border-zinc-800/30 bg-zinc-900/20" : "border-zinc-800/60 bg-zinc-900/40"
     }`}>
       <div className="flex items-start gap-2 p-3">
-        <GripVertical className="w-4 h-4 text-zinc-700 mt-1 shrink-0 cursor-grab" />
+        {/* Alça de arraste: sem onPointerDown ligado aos dragControls, o
+            Reorder.Item com dragListener={false} nunca arrastava. */}
+        <button onPointerDown={onDragStart} aria-label="Arrastar para reordenar"
+          className="mt-1 shrink-0 cursor-grab active:cursor-grabbing touch-none text-zinc-700 hover:text-zinc-500 transition-colors">
+          <GripVertical className="w-4 h-4" />
+        </button>
         <div className="shrink-0 mt-0.5">
           {done ? (
             <motion.div initial={{scale:0}} animate={{scale:1}}
@@ -303,20 +442,42 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
             <>
               <div className="flex items-center gap-1.5 mb-0.5">
                 {tarefa.tipo && (() => { const Icon=meta.icon; return <Icon className={`w-3 h-3 ${meta.color} shrink-0`}/>; })()}
-                <p className={`text-xs font-bold leading-tight ${done?"text-zinc-500 line-through":ativo?"text-lime-300":"text-zinc-200"}`}>
+                <p className={`text-xs font-bold leading-snug min-w-0 ${done?"text-zinc-500 line-through":ativo?"text-lime-300":"text-zinc-200"}`}>
                   {tarefa.titulo}
                 </p>
               </div>
               {expanded && tarefa.descricao && (
-                <p className="mono text-[10px] text-zinc-600 leading-relaxed mt-1">{tarefa.descricao}</p>
+                <p className="mono text-[10px] text-zinc-500 leading-relaxed mt-1">{tarefa.descricao}</p>
               )}
-              <div className="flex items-center gap-2 mt-1 flex-wrap">
+              {expanded && (tarefa.historico?.length ?? 0) > 0 && (
+                <div className="mt-2 space-y-1 border-l border-zinc-800 pl-2">
+                  <p className="mono text-[9px] text-zinc-500 uppercase tracking-widest">
+                    Versões anteriores ({tarefa.historico!.length})
+                  </p>
+                  {tarefa.historico!.map((v, i) => (
+                    <div key={i} className="flex items-start gap-2">
+                      <span className="mono text-[9px] text-zinc-500 flex-1 leading-relaxed truncate" title={v.instrucao}>
+                        v{i + 1} · {v.instrucao}
+                      </span>
+                      <button onClick={() => onRestaurar(i)}
+                        className="mono text-[9px] text-blue-400 hover:text-blue-300 shrink-0 transition-colors">
+                        restaurar
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {/* Meta + ações na mesma linha, DENTRO da coluna flexível.
+                  Quando as ações ficavam numa coluna própria com shrink-0, os
+                  5 botões comiam a largura da barra lateral e o título quebrava
+                  letra a letra. */}
+              <div className="flex items-center gap-2 mt-1.5 flex-wrap">
                 <span className={`mono text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${meta.color} ${meta.bg}`}>
                   {tarefa.complexidade}
                 </span>
                 {tarefa.score && (
-                  <span className="mono text-[9px] text-zinc-600">
-                    score <span style={{color:parseInt(tarefa.score)>=85?"#a3e635":parseInt(tarefa.score)>=70?"#facc15":"#f87171"}}>{tarefa.score}</span>
+                  <span className="mono text-[9px] text-zinc-500">
+                    score <span style={{color:corDoScore(lerScore(tarefa.score))}}>{tarefa.score}</span>
                   </span>
                 )}
                 {!done && !gerando && (
@@ -324,20 +485,21 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
                     ▶ gerar
                   </button>
                 )}
+                <div className="flex items-center gap-0.5 ml-auto">
+                  <button onClick={onToggle} aria-expanded={expanded} aria-label={expanded?"Recolher detalhes da tarefa":"Expandir detalhes da tarefa"}
+                    className="p-1 rounded hover:bg-zinc-800 text-zinc-500 hover:text-zinc-300 transition-colors">
+                    {expanded ? <ChevronUp className="w-3.5 h-3.5"/> : <ChevronDown className="w-3.5 h-3.5"/>}
+                  </button>
+                  <button onClick={()=>setEditando(true)} aria-label="Editar tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-500 hover:text-lime-400 transition-colors"><Pencil className="w-3.5 h-3.5"/></button>
+                  {done && <>
+                    <button onClick={()=>setShowReg(r=>!r)} aria-label="Regerar prompt desta tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-500 hover:text-blue-400 transition-colors"><RefreshCw className="w-3.5 h-3.5"/></button>
+                    <button onClick={onDownload} aria-label="Baixar prompt desta tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-500 hover:text-lime-400 transition-colors"><Download className="w-3.5 h-3.5"/></button>
+                  </>}
+                  <button onClick={onDeletar} aria-label="Excluir tarefa" className="p-1 rounded hover:bg-zinc-800 text-zinc-500 hover:text-red-400 transition-colors"><Trash2 className="w-3.5 h-3.5"/></button>
+                </div>
               </div>
             </>
           )}
-        </div>
-        <div className="flex items-center gap-1 shrink-0">
-          <button onClick={onToggle} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-zinc-400 transition-colors">
-            {expanded ? <ChevronUp className="w-3.5 h-3.5"/> : <ChevronDown className="w-3.5 h-3.5"/>}
-          </button>
-          {!editando && <button onClick={()=>setEditando(true)} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Pencil className="w-3.5 h-3.5"/></button>}
-          {done && <>
-            <button onClick={()=>setShowReg(r=>!r)} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-blue-400 transition-colors"><RefreshCw className="w-3.5 h-3.5"/></button>
-            <button onClick={onDownload} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-lime-400 transition-colors"><Download className="w-3.5 h-3.5"/></button>
-          </>}
-          <button onClick={onDeletar} className="p-1 rounded hover:bg-zinc-800 text-zinc-600 hover:text-red-400 transition-colors"><Trash2 className="w-3.5 h-3.5"/></button>
         </div>
       </div>
       <AnimatePresence>
@@ -363,12 +525,30 @@ function TodoItem({ tarefa, ativo, expanded, onToggle, onEditar, onRegerar, onDe
   );
 }
 
+/**
+ * Envolve o item da fila com os `dragControls` do framer-motion.
+ * Os controls precisam ser criados no componente que renderiza o `Reorder.Item`,
+ * por isso o filho vem como render prop que recebe o disparador de arraste.
+ */
+function TarefaArrastavel({ tarefa, children }: {
+  tarefa: TarefaQueue;
+  children: (iniciarArraste: (e: React.PointerEvent) => void) => React.ReactNode;
+}) {
+  const controls = useDragControls();
+  return (
+    <Reorder.Item value={tarefa} dragListener={false} dragControls={controls}>
+      {children(e => controls.start(e))}
+    </Reorder.Item>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────
 // PÁGINA DE PROJETO
 // ─────────────────────────────────────────────────────────────
-function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
+function PaginaProjeto({ ideiaProjeto, queue, setQueue, prefs, onVoltar }: {
   ideiaProjeto: string; queue: TarefaQueue[];
-  setQueue: React.Dispatch<React.SetStateAction<TarefaQueue[]>>; onVoltar: () => void;
+  setQueue: React.Dispatch<React.SetStateAction<TarefaQueue[]>>;
+  prefs: Preferencias; onVoltar: () => void;
 }) {
   const [tarefaAtivaId, setTarefaAtivaId] = useState<string|null>(null);
   const [expandedIds, setExpandedIds]     = useState<Set<string>>(new Set());
@@ -376,49 +556,93 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
   const [tarefaPromptId, setTarefaPromptId] = useState<string|null>(null);
   const [loading, setLoading]             = useState(false);
   const [stageIndex, setStageIndex]       = useState(0);
-  const [chatMsgs, setChatMsgs]           = useState<{role:"user"|"ia";texto:string}[]>([]);
-  const [chatInput, setChatInput]         = useState("");
-  const chatRef = useRef<HTMLDivElement>(null);
+  const [atividade, setAtividade]         = useState<{ok:boolean;texto:string}[]>([]);
+  const [contexto, setContexto]           = useState("");
+  const [erro, setErro]                   = useState<string|null>(null);
+  const logRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { chatRef.current?.scrollTo({top:chatRef.current.scrollHeight,behavior:"smooth"}); }, [chatMsgs]);
+  // Contexto compartilhado do projeto, injetado em toda geração de sub-tarefa.
+  useEffect(() => { setContexto(lerLocal<string>(LS_KEY_CONTEXTO) ?? ""); }, []);
+  const salvarContexto = (valor: string) => { setContexto(valor); salvarLocal(LS_KEY_CONTEXTO, valor || null); };
+
+  useEffect(() => { logRef.current?.scrollTo({top:logRef.current.scrollHeight,behavior:"smooth"}); }, [atividade]);
   useEffect(() => { if(!loading)return; const id=setInterval(()=>setStageIndex(p=>Math.min(p+1,STAGES.length-1)),4000); return ()=>clearInterval(id); }, [loading]);
 
-  const toggleExpand = (id:string) => setExpandedIds(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});
+  const toggleExpand = (id:string) => setExpandedIds(s=>{
+    const n = new Set(s);
+    if (n.has(id)) n.delete(id); else n.add(id);
+    return n;
+  });
 
   const gerarTarefa = useCallback(async (tarefa:TarefaQueue) => {
-    setLoading(true); setStageIndex(0); setTarefaAtivaId(tarefa.id);
+    setLoading(true); setStageIndex(0); setTarefaAtivaId(tarefa.id); setErro(null);
     setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"gerando"}:t));
     try {
-      const res = await fetch(`${API}/gerar`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ideiaBruta:`${tarefa.titulo}: ${tarefa.descricao}`,forcarSimples:true,tipoSugerido:tarefa.tipo})});
-      const data = await res.json();
-      if(data.tipo_resposta==="prompt_gerado"){
-        setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade,papel:data.deteccao?.papel_detectado}:t));
-        setPromptAtivo(data.prompt_otimizado); setTarefaPromptId(tarefa.id);
-        setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt gerado para "${tarefa.titulo}" · score ${data.pipeline?.score_qualidade}`}]);
-      }
-    } catch { setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"aguardando"}:t)); }
+      const data = await postApi<PromptResult>("gerar", {
+        ideiaBruta: `${tarefa.titulo}: ${tarefa.descricao}`,
+        forcarSimples: true,
+        tipoSugerido: tarefa.tipo,
+        contextoProjeto: contexto.trim() || undefined,
+        ...prefs,
+      });
+
+      if (data.tipo_resposta !== "prompt_gerado" || !data.prompt_otimizado)
+        throw new Error("A API não devolveu um prompt para esta tarefa.");
+
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade,papel:data.deteccao?.papel_detectado}:t));
+      setPromptAtivo(data.prompt_otimizado); setTarefaPromptId(tarefa.id);
+      setAtividade(a=>[...a,{ok:true,texto:`Prompt gerado para "${tarefa.titulo}" · score ${data.pipeline?.score_qualidade}`}]);
+    } catch (e) {
+      // Sem este reset a tarefa ficava presa em "gerando" para sempre.
+      const msg = mensagemDeErro(e);
+      setErro(msg);
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"aguardando"}:t));
+      setAtividade(a=>[...a,{ok:false,texto:`Falha ao gerar "${tarefa.titulo}": ${msg}`}]);
+    }
     finally { setLoading(false); setTarefaAtivaId(null); }
-  },[setQueue]);
+  },[setQueue, contexto, prefs]);
 
   const regerarTarefa = useCallback(async (tarefa:TarefaQueue, instrucao:string) => {
     if(!tarefa.prompt)return;
-    setLoading(true); setStageIndex(4); setTarefaAtivaId(tarefa.id);
+    setLoading(true); setStageIndex(4); setTarefaAtivaId(tarefa.id); setErro(null);
     setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"gerando"}:t));
     try {
-      const res = await fetch(`${API}/regerar`,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({promptAtual:tarefa.prompt,instrucaoMelhora:instrucao,papel:tarefa.papel,tipoObjetivo:tarefa.tipo})});
-      const data = await res.json();
-      if(data.prompt_otimizado){
-        setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",historico:[...(t.historico??[]),{prompt:t.prompt!,score:t.score!,instrucao}],prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade}:t));
-        setPromptAtivo(data.prompt_otimizado);
-        setChatMsgs(m=>[...m,{role:"ia",texto:`✓ Prompt de "${tarefa.titulo}" regerado · score ${data.pipeline?.score_qualidade}`}]);
-      }
-    } catch { setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido"}:t)); }
-    finally { setLoading(false); setTarefaAtivaId(null); }
-  },[setQueue]);
+      const data = await postApi<PromptResult>("regerar", {
+        promptAtual: tarefa.prompt,
+        instrucaoMelhora: instrucao,
+        papel: tarefa.papel,
+        tipoObjetivo: tarefa.tipo,
+        ...prefs,
+      });
 
-  const dl = (t:TarefaQueue) => { if(!t.prompt)return; const b=new Blob([t.prompt],{type:"text/plain"}); const u=URL.createObjectURL(b); const a=document.createElement("a"); a.href=u;a.download=`${t.titulo.slice(0,30)}.txt`;a.click();URL.revokeObjectURL(u); };
+      if (!data.prompt_otimizado)
+        throw new Error("A API não devolveu o prompt regerado.");
+
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido",historico:[...(t.historico??[]),{prompt:t.prompt!,score:t.score??"N/A",instrucao}],prompt:data.prompt_otimizado,score:data.pipeline?.score_qualidade}:t));
+      setPromptAtivo(data.prompt_otimizado);
+      setAtividade(a=>[...a,{ok:true,texto:`Prompt de "${tarefa.titulo}" regerado · score ${data.pipeline?.score_qualidade}`}]);
+    } catch (e) {
+      const msg = mensagemDeErro(e);
+      setErro(msg);
+      setQueue(q=>q.map(t=>t.id===tarefa.id?{...t,status:"concluido"}:t));
+      setAtividade(a=>[...a,{ok:false,texto:`Falha ao regerar "${tarefa.titulo}": ${msg}`}]);
+    }
+    finally { setLoading(false); setTarefaAtivaId(null); }
+  },[setQueue, prefs]);
+
+  /** Volta uma tarefa para uma versão anterior do prompt, descartando as posteriores. */
+  const restaurarVersao = useCallback((tarefa: TarefaQueue, indice: number) => {
+    const versao = tarefa.historico?.[indice];
+    if (!versao) return;
+    setQueue(q => q.map(t => t.id === tarefa.id
+      ? { ...t, prompt: versao.prompt, score: versao.score, historico: t.historico?.slice(0, indice) }
+      : t));
+    setPromptAtivo(versao.prompt);
+    setTarefaPromptId(tarefa.id);
+    setAtividade(a => [...a, { ok: true, texto: `Restaurada a versão v${indice + 1} de "${tarefa.titulo}"` }]);
+  }, [setQueue]);
+
+  const dl = (t:TarefaQueue) => { if(!t.prompt)return; baixarTexto(t.prompt, `${nomeDeArquivo(t.titulo)}.txt`); };
   const concluidos=queue.filter(t=>t.status==="concluido").length;
   const total=queue.length;
   const progresso=total>0?Math.round((concluidos/total)*100):0;
@@ -426,7 +650,6 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
 
   return (
     <div className="min-h-screen flex flex-col" style={{background:"#030712"}}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=JetBrains+Mono:wght@400;500&display=swap');*,*::before,*::after{font-family:'Syne',sans-serif;box-sizing:border-box}.mono{font-family:'JetBrains Mono',monospace!important}.bg-grid{background-image:linear-gradient(rgba(163,230,53,0.02) 1px,transparent 1px),linear-gradient(90deg,rgba(163,230,53,0.02) 1px,transparent 1px);background-size:44px 44px}::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(163,230,53,0.15);border-radius:4px}`}</style>
       <div className="fixed inset-0 bg-grid pointer-events-none"/>
       {/* Top bar */}
       <div className="relative z-10 flex items-center justify-between px-6 py-3 border-b border-zinc-800/60" style={{background:"rgba(3,7,18,0.9)",backdropFilter:"blur(20px)"}}>
@@ -457,22 +680,26 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
       {/* 3 colunas */}
       <div className="relative z-10 flex flex-1 overflow-hidden">
         {/* To-do */}
-        <div className="w-80 shrink-0 border-r border-zinc-800/60 flex flex-col" style={{background:"rgba(3,7,18,0.95)"}}>
+        <div className="w-96 shrink-0 border-r border-zinc-800/60 flex flex-col" style={{background:"rgba(3,7,18,0.95)"}}>
           <div className="px-4 py-3 border-b border-zinc-800/40 flex items-center justify-between">
             <span className="mono text-[10px] text-zinc-600 tracking-widest uppercase">To-do list</span>
             <span className="mono text-[10px] text-zinc-700">{concluidos}/{total}</span>
           </div>
           <div className="flex-1 overflow-y-auto p-3">
             <Reorder.Group axis="y" values={queue} onReorder={setQueue} className="space-y-2">
-              {queue.map((tarefa,i)=>(
-                <Reorder.Item key={tarefa.id} value={tarefa} dragListener={false}>
-                  <TodoItem tarefa={tarefa} ativo={tarefa.id===tarefaAtivaId}
-                    expanded={expandedIds.has(tarefa.id)} onToggle={()=>toggleExpand(tarefa.id)}
-                    onEditar={(t,d)=>setQueue(q=>q.map(x=>x.id===tarefa.id?{...x,titulo:t,descricao:d}:x))}
-                    onRegerar={instr=>regerarTarefa(tarefa,instr)}
-                    onDeletar={()=>setQueue(q=>q.filter(x=>x.id!==tarefa.id))}
-                    onDownload={()=>dl(tarefa)} onGerar={()=>gerarTarefa(tarefa)}/>
-                </Reorder.Item>
+              {queue.map((tarefa)=>(
+                <TarefaArrastavel key={tarefa.id} tarefa={tarefa}>
+                  {(iniciarArraste)=>(
+                    <TodoItem tarefa={tarefa} ativo={tarefa.id===tarefaAtivaId}
+                      expanded={expandedIds.has(tarefa.id)} onToggle={()=>toggleExpand(tarefa.id)}
+                      onEditar={(t,d)=>setQueue(q=>q.map(x=>x.id===tarefa.id?{...x,titulo:t,descricao:d}:x))}
+                      onRegerar={instr=>regerarTarefa(tarefa,instr)}
+                      onDeletar={()=>setQueue(q=>q.filter(x=>x.id!==tarefa.id))}
+                      onDownload={()=>dl(tarefa)} onGerar={()=>gerarTarefa(tarefa)}
+                      onDragStart={iniciarArraste}
+                      onRestaurar={(i)=>restaurarVersao(tarefa,i)}/>
+                  )}
+                </TarefaArrastavel>
               ))}
             </Reorder.Group>
           </div>
@@ -497,6 +724,17 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
               </motion.div>
             )}
           </AnimatePresence>
+          <AnimatePresence>
+            {erro && (
+              <motion.div initial={{opacity:0,y:-8}} animate={{opacity:1,y:0}} exit={{opacity:0}} role="alert"
+                className="m-4 flex items-start gap-3 px-4 py-3 rounded-xl border border-red-500/25 bg-red-500/5">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5"/>
+                <p className="mono text-[11px] text-red-200 break-words flex-1">{erro}</p>
+                <button onClick={()=>setErro(null)} aria-label="Fechar aviso de erro"
+                  className="text-zinc-600 hover:text-zinc-300 transition-colors shrink-0"><X className="w-4 h-4"/></button>
+              </motion.div>
+            )}
+          </AnimatePresence>
           <div className="flex-1 overflow-y-auto p-6">
             {promptAtivo ? (
               <div className="space-y-3">
@@ -507,7 +745,7 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
                   </div>
                   <div className="flex gap-2">
                     <button onClick={()=>{const t=queue.find(t=>t.id===tarefaPromptId);if(t)dl(t);}} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Download className="w-3 h-3"/>baixar</button>
-                    <button onClick={()=>navigator.clipboard.writeText(promptAtivo)} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Copy className="w-3 h-3"/>copiar</button>
+                    <button onClick={async()=>{ if(!await copiar(promptAtivo)) setErro("Não foi possível copiar: o navegador bloqueia a área de transferência fora de https ou localhost."); }} className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all"><Copy className="w-3 h-3"/>copiar</button>
                   </div>
                 </div>
                 <div className="p-5 rounded-xl border border-zinc-800/60 bg-zinc-900/40">
@@ -528,31 +766,43 @@ function PaginaProjeto({ ideiaProjeto, queue, setQueue, onVoltar }: {
           </div>
         </div>
 
-        {/* Chat */}
+        {/* Contexto do projeto + atividade.
+            Substitui o antigo "chat", que respondia com um texto fixo por
+            setTimeout e não falava com nenhum backend. O contexto digitado aqui
+            é injetado em toda geração de sub-tarefa. */}
         <div className="w-72 shrink-0 border-l border-zinc-800/60 flex flex-col" style={{background:"rgba(3,7,18,0.95)"}}>
           <div className="px-4 py-3 border-b border-zinc-800/40 flex items-center gap-2">
-            <MessageSquare className="w-4 h-4 text-zinc-600"/>
-            <span className="mono text-[10px] text-zinc-600 tracking-widest uppercase">Chat do projeto</span>
+            <FileText className="w-4 h-4 text-zinc-500"/>
+            <label htmlFor="contexto-projeto" className="mono text-[10px] text-zinc-500 tracking-widest uppercase">
+              Contexto do projeto
+            </label>
           </div>
-          <div ref={chatRef} className="flex-1 overflow-y-auto p-3 space-y-2">
-            {chatMsgs.length===0?(
-              <div className="text-center pt-8"><p className="mono text-xs text-zinc-700">Direcionamentos gerais do projeto</p></div>
-            ):chatMsgs.map((m,i)=>(
+          <div className="p-3 space-y-2 border-b border-zinc-800/40">
+            <textarea id="contexto-projeto" value={contexto} onChange={e=>salvarContexto(e.target.value)}
+              rows={7} placeholder="Stack, convenções, restrições... Vale para todas as tarefas deste projeto."
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-lime-500/30 resize-none leading-relaxed transition-colors"/>
+            <p className="mono text-[10px] text-zinc-500">
+              {contexto.trim()
+                ? "Enviado junto com cada tarefa gerada."
+                : "Sem contexto, cada sub-tarefa é gerada isolada."}
+            </p>
+          </div>
+
+          <div className="px-4 py-2 border-b border-zinc-800/40 flex items-center gap-2">
+            <MessageSquare className="w-3.5 h-3.5 text-zinc-500"/>
+            <span className="mono text-[10px] text-zinc-500 tracking-widest uppercase">Atividade</span>
+          </div>
+          <div ref={logRef} className="flex-1 overflow-y-auto p-3 space-y-2">
+            {atividade.length===0 ? (
+              <p className="mono text-[11px] text-zinc-600 text-center pt-6">Nada gerado ainda.</p>
+            ) : atividade.map((m,i)=>(
               <motion.div key={i} initial={{opacity:0,y:4}} animate={{opacity:1,y:0}}
-                className={`flex ${m.role==="user"?"justify-end":"justify-start"}`}>
-                <div className={`max-w-[85%] px-3 py-2 rounded-xl text-xs leading-relaxed ${m.role==="user"?"bg-lime-500/10 border border-lime-500/20 text-lime-300":"bg-zinc-800/60 border border-zinc-700/40 text-zinc-300"}`}>
-                  {m.texto}
-                </div>
+                className={`px-3 py-2 rounded-lg text-[11px] leading-relaxed border ${
+                  m.ok ? "bg-zinc-800/40 border-zinc-700/40 text-zinc-300"
+                       : "bg-red-500/5 border-red-500/25 text-red-200"}`}>
+                {m.ok ? "✓" : "✕"} {m.texto}
               </motion.div>
             ))}
-          </div>
-          <div className="p-3 border-t border-zinc-800/40">
-            <div className="flex gap-2">
-              <input value={chatInput} onChange={e=>setChatInput(e.target.value)}
-                onKeyDown={e=>{ if(e.key!=="Enter"||!chatInput.trim())return; setChatMsgs(m=>[...m,{role:"user",texto:chatInput}]); setChatInput(""); setTimeout(()=>setChatMsgs(m=>[...m,{role:"ia",texto:"Entendido. Use o ↺ em cada tarefa para aplicar melhorias específicas."}]),600); }}
-                placeholder="Mensagem..." className="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-700 outline-none"/>
-              <button onClick={()=>{ if(!chatInput.trim())return; setChatMsgs(m=>[...m,{role:"user",texto:chatInput}]); setChatInput(""); }} disabled={!chatInput.trim()} className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 disabled:opacity-30 transition-colors"><Send className="w-3.5 h-3.5"/></button>
-            </div>
           </div>
         </div>
       </div>
@@ -571,14 +821,19 @@ export default function Home() {
   const [tipoSelecionado, setTipoSelecionado] = useState<TipoObjetivo | null>(null);
   const [tipoConfirmado, setTipoConfirmado]   = useState<TipoObjetivo | undefined>();
   const [resultado, setResultado]       = useState<PromptResult | null>(null);
-  const [executorSelecionado, setExecutorSelecionado] = useState<string>("");
+  const [prefs, setPrefs]               = useState<Preferencias>(PREFS_PADRAO);
   const [perguntas, setPerguntas]       = useState<PerguntaClarificacao[]>([]);
   const [loading, setLoading]           = useState(false);
   const [stageIndex, setStageIndex]     = useState(0);
+  const [decorrido, setDecorrido]       = useState(0);
   const [copied, setCopied]             = useState(false);
   const [erroAPI, setErroAPI]           = useState<string | null>(null);
   const [queue, setQueue]               = useState<TarefaQueue[]>([]);
   const [ideiaProjeto, setIdeiaProjeto] = useState("");
+  const [versoes, setVersoes]           = useState<VersaoPrompt[]>([]);
+  const [instrucaoRefino, setInstrucaoRefino] = useState("");
+  const [mostrarRefino, setMostrarRefino]     = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
   const [cols] = useState(() =>
     Array.from({ length: 22 }, (_, i) => ({
       x: i * 4.8,
@@ -590,84 +845,163 @@ export default function Home() {
   );
   const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { try { const q=localStorage.getItem(LS_KEY_QUEUE); const p=localStorage.getItem(LS_KEY_PROJETO); const r=localStorage.getItem(LS_KEY_RESULTADO); if(q)setQueue(JSON.parse(q)); if(p)setIdeiaProjeto(JSON.parse(p)); if(r)setResultado(JSON.parse(r)); } catch{} }, []);
-  useEffect(() => { if(queue.length>0)localStorage.setItem(LS_KEY_QUEUE,JSON.stringify(queue)); }, [queue]);
-  useEffect(() => { if(resultado)localStorage.setItem(LS_KEY_RESULTADO,JSON.stringify(resultado)); }, [resultado]);
+  // Restaura o estado salvo apenas no cliente, para não divergir do HTML do SSR.
+  const [hidratado, setHidratado] = useState(false);
+  useEffect(() => {
+    const q = lerLocal<TarefaQueue[]>(LS_KEY_QUEUE);
+    const p = lerLocal<string>(LS_KEY_PROJETO);
+    const r = lerLocal<PromptResult>(LS_KEY_RESULTADO);
+    const f = lerLocal<Partial<Preferencias>>(LS_KEY_PREFS);
+    if (Array.isArray(q)) setQueue(q);
+    if (typeof p === "string") setIdeiaProjeto(p);
+    if (r?.prompt_otimizado) setResultado(r);
+    if (f) setPrefs({ ...PREFS_PADRAO, ...f });
+    setHidratado(true);
+  }, []);
+
+  // Só persiste depois de hidratar: gravar antes sobrescreveria o estado salvo
+  // com os valores iniciais vazios.
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_QUEUE, queue); }, [queue, hidratado]);
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_RESULTADO, resultado); }, [resultado, hidratado]);
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_PROJETO, ideiaProjeto || null); }, [ideiaProjeto, hidratado]);
+  useEffect(() => { if(hidratado) salvarLocal(LS_KEY_PREFS, prefs); }, [prefs, hidratado]);
+
   useEffect(() => { if(!loading)return; const id=setInterval(()=>setStageIndex(p=>Math.min(p+1,STAGES.length-1)),4000); return ()=>clearInterval(id); }, [loading]);
+
+  // Tempo decorrido: o avanço das etapas é estimado, então mostrar o relógio
+  // real evita passar a impressão de progresso medido.
+  useEffect(() => {
+    if (!loading) { setDecorrido(0); return; }
+    const inicio = Date.now();
+    const id = setInterval(() => setDecorrido(Math.round((Date.now() - inicio) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [loading]);
+
+  // Cancela a geração em curso. O backend encadeia o cancelamento e para de
+  // gastar chamadas ao OpenRouter.
+  const cancelar = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+  }, []);
 
 
 
   const chamarAPI = useCallback(async (opts: {
     ideiaTexto: string; forcarSimples?: boolean; respostas?: Record<string, string>;
   }) => {
-    setLoading(true); setResultado(null); setStageIndex(0); setErroAPI(null);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    setLoading(true); setResultado(null); setVersoes([]); setStageIndex(0); setErroAPI(null);
     try {
       const body: Record<string, unknown> = {
         ideiaBruta: opts.ideiaTexto,
         forcarSimples: opts.forcarSimples ?? false,
+        ...prefs,
       };
       if (papelEditado.trim()) body.papel = papelEditado.trim();
       if (tipoSelecionado)     body.tipoSugerido = tipoSelecionado;
       if (opts.respostas && Object.keys(opts.respostas).length > 0) body.respostasClarificacao = opts.respostas;
-      if (executorSelecionado.trim()) body.executorAlvo = executorSelecionado.trim();
 
-      setErroAPI(null);
-      const res  = await fetch(`${API}/gerar`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
-      const data: any = await res.json();
-
-      if (!res.ok) {
-        const msg = data?.erro ?? data?.detalhes ?? `Erro ${res.status}`;
-        setErroAPI(msg);
-        return;
-      }
+      const data = await postApi<ResultData>("gerar", body, controller.signal);
 
       if (data.tipo_resposta === "clarificacao_necessaria") {
-        const c = data as ClarificacaoResult;
-        setPerguntas(c.perguntas);
-        setTipoConfirmado(c.tipo_confirmado);
+        setPerguntas(data.perguntas ?? []);
+        setTipoConfirmado(data.tipo_confirmado);
         setAppState("clarificando");
       } else if (data.tipo_resposta === "plano_de_divisao") {
-        const p = data as PlanoResult;
-        setTipoConfirmado(p.tipo_confirmado);
-        const novas = p.sub_tarefas.map((s,i) => ({
+        setTipoConfirmado(data.tipo_confirmado);
+        const novas: TarefaQueue[] = (data.sub_tarefas ?? []).map((s,i) => ({
           id:`${Date.now()}_${i}`, titulo:s.titulo, descricao:s.descricao,
-          complexidade:s.complexidade as TarefaQueue["complexidade"],
-          status:"aguardando" as const, tipo:p.tipo_confirmado,
+          complexidade:s.complexidade, status:"aguardando" as const, tipo:data.tipo_confirmado,
         }));
-        setQueue(novas); setIdeiaProjeto(opts.ideiaTexto);
-        localStorage.setItem(LS_KEY_PROJETO, JSON.stringify(opts.ideiaTexto));
+        setQueue(novas);
+        setIdeiaProjeto(opts.ideiaTexto);
         setAppState("projeto");
       } else {
-        const pr = data as PromptResult;
-        setTipoConfirmado(pr.deteccao?.tipo_confirmado);
-        setResultado(pr);
+        setTipoConfirmado(data.deteccao?.tipo_confirmado);
+        setResultado(data);
         setAppState("home");
       }
-    } catch (e: any) {
-      setErroAPI(`Erro de conexão: ${e?.message ?? "Verifique se a API C# está rodando em localhost:5117"}`);
-    } finally { setLoading(false); }
-  }, [papelEditado, tipoSelecionado, executorSelecionado]);
+    } catch (e) {
+      // Cancelamento é ação do usuário, não erro a reportar.
+      if (!foiCancelado(e)) setErroAPI(mensagemDeErro(e));
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setLoading(false);
+    }
+  }, [papelEditado, tipoSelecionado, prefs]);
+
+  /**
+   * Refina o prompt já gerado sem recomeçar o pipeline.
+   * O endpoint /regerar existia desde o começo, mas só a página de projeto o
+   * usava — no fluxo principal não havia como iterar sobre o resultado.
+   */
+  const refinar = useCallback(async (instrucao: string) => {
+    if (!resultado || !instrucao.trim()) return;
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    const anterior = resultado;
+    setLoading(true); setStageIndex(4); setErroAPI(null); setMostrarRefino(false);
+    try {
+      const data = await postApi<PromptResult>("regerar", {
+        promptAtual: anterior.prompt_otimizado,
+        instrucaoMelhora: instrucao.trim(),
+        papel: anterior.deteccao?.papel_detectado,
+        formato: anterior.deteccao?.formato_detectado,
+        tipoObjetivo: anterior.tipo_objetivo,
+        ...prefs,
+      }, controller.signal);
+
+      if (!data.prompt_otimizado) throw new Error("A API não devolveu o prompt refinado.");
+
+      setVersoes(v => [...v, {
+        prompt: anterior.prompt_otimizado,
+        score: anterior.pipeline?.score_qualidade ?? "N/A",
+        instrucao: instrucao.trim(),
+      }]);
+      setResultado({ ...anterior, ...data, deteccao: anterior.deteccao });
+      setInstrucaoRefino("");
+    } catch (e) {
+      if (!foiCancelado(e)) setErroAPI(mensagemDeErro(e));
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setLoading(false);
+    }
+  }, [resultado, prefs]);
+
+  /** Volta para uma versão anterior, descartando os refinos posteriores. */
+  const restaurarVersao = useCallback((indice: number) => {
+    setVersoes(v => {
+      const alvo = v[indice];
+      if (!alvo) return v;
+      setResultado(r => r && ({
+        ...r,
+        prompt_otimizado: alvo.prompt,
+        pipeline: { ...r.pipeline, score_qualidade: alvo.score },
+      }));
+      return v.slice(0, indice);
+    });
+  }, []);
 
   if (appState === "projeto") {
-    return <PaginaProjeto ideiaProjeto={ideiaProjeto} queue={queue} setQueue={setQueue} onVoltar={()=>setAppState("home")}/>;
+    return <PaginaProjeto ideiaProjeto={ideiaProjeto} queue={queue} setQueue={setQueue}
+      prefs={prefs} onVoltar={()=>setAppState("home")}/>;
   }
 
-  const scoreNum   = parseInt(resultado?.pipeline?.score_qualidade ?? "0", 10);
-  const scoreColor = scoreNum >= 85 ? "#a3e635" : scoreNum >= 70 ? "#facc15" : "#f87171";
+  // O backend pode devolver "N/A"; sem esta guarda o valor virava NaN e o
+  // strokeDasharray do anel de score saía inválido.
+  const scoreNum   = lerScore(resultado?.pipeline?.score_qualidade);
+  const scoreColor = corDoScore(scoreNum);
+  const scoreDash  = offsetDoScore(scoreNum);
 
   return (
     <div className="relative min-h-screen overflow-hidden flex flex-col items-center py-12 px-6" style={{background:"#030712"}}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-        *,*::before,*::after{font-family:'Syne',sans-serif;box-sizing:border-box}
-        .mono{font-family:'JetBrains Mono',monospace!important}
-        .bg-grid{background-image:linear-gradient(rgba(163,230,53,0.022) 1px,transparent 1px),linear-gradient(90deg,rgba(163,230,53,0.022) 1px,transparent 1px);background-size:44px 44px}
-        .glow-input:focus{box-shadow:0 0 0 1px rgba(163,230,53,0.3),0 0 18px rgba(163,230,53,0.06)}
-        .scanline::before{content:'';position:absolute;inset:0;pointer-events:none;z-index:1;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.05) 2px,rgba(0,0,0,0.05) 4px)}
-        @keyframes sd{from{stroke-dashoffset:226}to{stroke-dashoffset:var(--t)}}.score-ring{animation:sd 1.2s ease-out forwards}
-        ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(163,230,53,0.18);border-radius:4px}
-      `}</style>
-
       <div className="fixed inset-0 bg-grid pointer-events-none"/>
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         {cols.map((c,i)=><MatrixCol key={i} x={c.x} delay={c.delay} chars={c.chars} duration={c.duration}/>)}
@@ -679,7 +1013,7 @@ export default function Home() {
         {/* Header */}
         <motion.div initial={{opacity:0,y:-20}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:[0.16,1,0.3,1]}} className="space-y-2">
           <div className="flex items-center justify-between">
-            <div className="mono text-xs text-lime-500 tracking-[0.25em] uppercase">v6.0 · Multi-objetivo + Visão</div>
+            <div className="mono text-xs text-lime-500 tracking-[0.25em] uppercase">v6.0 · Multi-objetivo</div>
             {queue.length > 0 && (
               <button onClick={()=>setAppState("projeto")}
                 className="flex items-center gap-1.5 mono text-[11px] text-zinc-500 hover:text-lime-400 border border-zinc-800 hover:border-lime-500/30 px-3 py-1.5 rounded-lg transition-all">
@@ -693,8 +1027,9 @@ export default function Home() {
             Prompt<br/>
             <span style={{WebkitTextFillColor:"transparent",WebkitTextStroke:"1px rgba(163,230,53,0.4)"}}>Architect</span>
           </h1>
-          <p className="text-zinc-500 text-sm max-w-xs leading-relaxed">
-            Selecione o objetivo, descreva a ideia. 95%+ de força em qualquer IA.
+          <p className="text-zinc-400 text-sm max-w-sm leading-relaxed">
+            Selecione o objetivo e descreva a ideia. Um pipeline de agentes
+            classifica, analisa, gera e audita o prompt final.
           </p>
         </motion.div>
 
@@ -706,33 +1041,8 @@ export default function Home() {
             <ObjetivoSelector valor={tipoSelecionado} onChange={setTipoSelecionado} tipoConfirmado={tipoConfirmado}/>
           </div>
 
-          {/* Executor */}
-          <div className="p-4 rounded-2xl border border-zinc-800/80 bg-zinc-900/50 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="mono text-[10px] text-zinc-600 tracking-[0.2em] uppercase">Executor</span>
-              <span className="mono text-[10px] text-zinc-700">quem vai rodar este prompt</span>
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              {([
-                { id:"",              label:"Qualquer IA",  icon:"✦" },
-                { id:"Claude Code",   label:"Claude Code",  icon:"◆" },
-                { id:"Google Jules",  label:"Jules",        icon:"◈" },
-                { id:"OpenHands",     label:"OpenHands",    icon:"◉" },
-                { id:"Cursor",        label:"Cursor",       icon:"◎" },
-                { id:"Windsurf",      label:"Windsurf",     icon:"◍" },
-              ] as {id:string;label:string;icon:string}[]).map(e => (
-                <button key={e.id} onClick={()=>setExecutorSelecionado(e.id)}
-                  className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-bold transition-all ${executorSelecionado===e.id ? "border-lime-500/40 bg-lime-500/10 text-lime-400" : "border-zinc-800/60 bg-zinc-900/40 text-zinc-600 hover:text-zinc-400 hover:border-zinc-700"}`}>
-                  <span className="text-[11px]">{e.icon}</span>{e.label}
-                </button>
-              ))}
-            </div>
-            {executorSelecionado && (
-              <p className="mono text-[10px] text-zinc-600">
-                Prompt otimizado para <span className="text-lime-500">{executorSelecionado}</span> — estrutura, verbosidade e formato adaptados.
-              </p>
-            )}
-          </div>
+          {/* Preferências de saída: executor, nível de detalhe e idioma */}
+          <PreferenciasPanel prefs={prefs} onChange={setPrefs} />
 
           {/* Papel */}
           <div className="flex items-center gap-3 px-4 py-3 rounded-xl border border-zinc-800/80 bg-zinc-900/50" style={{minHeight:50}}>
@@ -748,6 +1058,7 @@ export default function Home() {
               </span>
             )}
             <button onClick={()=>{setEditandoPapel(true);setTimeout(()=>inputRef.current?.focus(),40);}}
+              aria-label="Editar o papel técnico usado no prompt"
               className="shrink-0 p-1.5 rounded-md hover:bg-zinc-800 transition-colors group">
               <Pencil className="w-3 h-3 text-zinc-600 group-hover:text-lime-400 transition-colors"/>
             </button>
@@ -759,31 +1070,49 @@ export default function Home() {
           <div className="space-y-2">
             <div className="relative">
               <textarea value={ideia} onChange={e=>setIdeia(e.target.value)}
+                onKeyDown={e=>{ if((e.metaKey||e.ctrlKey)&&e.key==="Enter"&&ideia.trim()&&!loading) chamarAPI({ideiaTexto:ideia}); }}
                 placeholder="Descreva sua ideia. Para imagem: descreva o que quer criar. Para código: explique o problema..."
-                disabled={loading}
-                className="glow-input w-full h-44 p-5 bg-zinc-900/60 border border-zinc-800/80 rounded-2xl text-zinc-200 text-sm leading-relaxed placeholder:text-zinc-700 outline-none resize-none transition-all disabled:opacity-40"/>
-              <span className="absolute bottom-3 right-4 mono text-[10px] text-zinc-700">{ideia.length}</span>
+                disabled={loading} aria-label="Descreva sua ideia"
+                className="glow-input w-full h-44 p-5 bg-zinc-900/60 border border-zinc-800/80 rounded-2xl text-zinc-200 text-sm leading-relaxed placeholder:text-zinc-600 outline-none resize-none transition-all disabled:opacity-40"/>
+              <span className="absolute bottom-3 right-4 mono text-[10px] text-zinc-500">{ideia.length}</span>
             </div>
-            <motion.button onClick={()=>chamarAPI({ideiaTexto:ideia})}
-              disabled={loading||!ideia.trim()} whileHover={{scale:1.01}} whileTap={{scale:0.98}}
-              className="w-full flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-              style={{background:loading?"rgba(163,230,53,0.08)":"linear-gradient(135deg,#a3e635,#4ade80)",color:loading?"#a3e635":"#030712",border:loading?"1px solid rgba(163,230,53,0.25)":"none"}}>
-              {loading
-                ?<><motion.div animate={{rotate:360}} transition={{duration:1,repeat:Infinity,ease:"linear"}} className="w-4 h-4 rounded-full border-2 border-lime-500 border-t-transparent"/>Processando</>
-                :<>Gerar Prompt <ArrowRight className="w-4 h-4"/></>}
-            </motion.button>
+            <div className="flex gap-2">
+              <motion.button onClick={()=>chamarAPI({ideiaTexto:ideia})}
+                disabled={loading||!ideia.trim()} whileHover={{scale:1.01}} whileTap={{scale:0.98}}
+                className="flex-1 flex items-center justify-center gap-2 py-3.5 rounded-xl font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                style={{background:loading?"rgba(163,230,53,0.08)":"linear-gradient(135deg,#a3e635,#4ade80)",color:loading?"#a3e635":"#030712",border:loading?"1px solid rgba(163,230,53,0.25)":"none"}}>
+                {loading
+                  ?<><motion.div animate={{rotate:360}} transition={{duration:1,repeat:Infinity,ease:"linear"}} className="w-4 h-4 rounded-full border-2 border-lime-500 border-t-transparent"/>Processando · {decorrido}s</>
+                  :<>Gerar Prompt <ArrowRight className="w-4 h-4"/></>}
+              </motion.button>
+              {loading && (
+                <button onClick={cancelar}
+                  className="px-4 py-3.5 rounded-xl text-xs font-bold text-zinc-400 hover:text-red-300 border border-zinc-800 hover:border-red-500/30 transition-colors">
+                  Cancelar
+                </button>
+              )}
+            </div>
+            <p className="mono text-[10px] text-zinc-600 text-center">
+              {loading ? "Cancelar interrompe também as chamadas no backend." : "⌘/Ctrl + Enter para gerar"}
+            </p>
           </div>
         </motion.div>
 
         {/* Loading */}
         <AnimatePresence>
           {loading && (
-            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0,y:-8}} className="space-y-1.5">
-              {STAGES.map((s,i)=>{const active=i===stageIndex,done=i<stageIndex;return(
-                <motion.div key={i} initial={{opacity:0,x:-8}} animate={{opacity:done?0.35:active?1:0.18,x:0}} transition={{delay:i*0.04}}
+            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0,y:-8}} className="space-y-1.5" aria-live="polite">
+              {/* As etapas do pipeline são um roteiro, não medição: o backend não
+                  reporta progresso, então nenhuma etapa é marcada como concluída. */}
+              <div className="flex items-center justify-between px-4 pb-1">
+                <span className="mono text-[10px] text-zinc-500 tracking-widest uppercase">Etapas do pipeline</span>
+                <span className="mono text-[10px] text-zinc-500">estimativa · {decorrido}s</span>
+              </div>
+              {STAGES.map((s,i)=>{const active=i===stageIndex;return(
+                <motion.div key={i} initial={{opacity:0,x:-8}} animate={{opacity:active?1:0.3,x:0}} transition={{delay:i*0.04}}
                   className={`flex items-center gap-3 px-4 py-2.5 rounded-xl border transition-all ${active?`${s.bg} ${s.border} border`:"border-transparent"}`}>
-                  {done?<CheckCircle2 className="w-4 h-4 text-lime-500 shrink-0"/>:<Shield className={`w-4 h-4 shrink-0 ${active?s.color:"text-zinc-700"} ${active?"animate-pulse":""}`}/>}
-                  <span className={`mono text-xs ${active?s.color:done?"text-zinc-700 line-through":"text-zinc-700"}`}>{s.label}</span>
+                  <Shield className={`w-4 h-4 shrink-0 ${active?s.color:"text-zinc-600"} ${active?"animate-pulse":""}`}/>
+                  <span className={`mono text-xs ${active?s.color:"text-zinc-500"}`}>{s.label}</span>
                   {active&&<div className="ml-auto flex gap-1">{[0,1,2].map(d=><motion.div key={d} className="w-1 h-1 rounded-full bg-lime-500" animate={{opacity:[0.3,1,0.3]}} transition={{duration:0.9,repeat:Infinity,delay:d*0.2}}/>)}</div>}
                 </motion.div>
               );})}
@@ -794,7 +1123,7 @@ export default function Home() {
         {/* Erro da API */}
         <AnimatePresence>
           {erroAPI && !loading && (
-            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0}}
+            <motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} exit={{opacity:0}} role="alert"
               className="flex items-start gap-3 px-4 py-3.5 rounded-xl border border-red-500/25 bg-red-500/5">
               <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5"/>
               <div className="flex-1 min-w-0">
@@ -802,7 +1131,7 @@ export default function Home() {
                 <p className="mono text-[11px] text-zinc-500 mt-0.5 break-words">{erroAPI}</p>
                 <p className="mono text-[10px] text-zinc-700 mt-1">Veja o console do dotnet para mais detalhes.</p>
               </div>
-              <button onClick={()=>setErroAPI(null)} className="text-zinc-700 hover:text-zinc-400 transition-colors shrink-0">
+              <button onClick={()=>setErroAPI(null)} aria-label="Fechar aviso de erro" className="text-zinc-700 hover:text-zinc-400 transition-colors shrink-0">
                 <X className="w-4 h-4"/>
               </button>
             </motion.div>
@@ -841,7 +1170,7 @@ export default function Home() {
                   <svg width="56" height="56" viewBox="0 0 80 80">
                     <circle cx="40" cy="40" r="36" fill="none" stroke="#1f2937" strokeWidth="6"/>
                     <circle cx="40" cy="40" r="36" fill="none" stroke={scoreColor} strokeWidth="6" strokeLinecap="round" strokeDasharray="226" className="score-ring"
-                      style={{transformOrigin:"center",transform:"rotate(-90deg)","--t":`${226-(226*scoreNum)/100}`} as React.CSSProperties}/>
+                      style={{transformOrigin:"center",transform:"rotate(-90deg)","--t":`${scoreDash}`} as React.CSSProperties}/>
                     <text x="40" y="46" textAnchor="middle" fill={scoreColor} fontSize="17" fontWeight="800" fontFamily="JetBrains Mono">{resultado?.pipeline?.score_qualidade}</text>
                   </svg>
                 </div>
@@ -857,11 +1186,14 @@ export default function Home() {
                     <span className="mono text-[11px] text-zinc-500 tracking-widest uppercase">Super Prompt</span>
                   </div>
                   <div className="flex gap-2">
-                    <button onClick={()=>{const b=new Blob([resultado.prompt_otimizado],{type:"text/plain"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download="prompt.txt";a.click();URL.revokeObjectURL(u);}}
+                    <button onClick={()=>baixarTexto(resultado.prompt_otimizado,"prompt.txt")}
                       className="flex items-center gap-1 mono text-[10px] text-zinc-600 hover:text-lime-400 px-2 py-1.5 rounded border border-transparent hover:border-zinc-800 transition-all">
                       <Download className="w-3 h-3"/>baixar
                     </button>
-                    <motion.button onClick={()=>{navigator.clipboard.writeText(resultado.prompt_otimizado);setCopied(true);setTimeout(()=>setCopied(false),2000);}}
+                    <motion.button onClick={async()=>{
+                        if (await copiar(resultado.prompt_otimizado)) { setCopied(true); setTimeout(()=>setCopied(false),2000); }
+                        else setErroAPI("Não foi possível copiar: o navegador bloqueia a área de transferência fora de https ou localhost.");
+                      }}
                       whileTap={{scale:0.94}}
                       className="flex items-center gap-1.5 mono text-[10px] px-3 py-1.5 rounded-lg border transition-all"
                       style={{borderColor:copied?"rgba(163,230,53,0.4)":"rgba(63,63,70,0.5)",color:copied?"#a3e635":"#71717a",background:copied?"rgba(163,230,53,0.05)":"transparent"}}>
@@ -874,7 +1206,63 @@ export default function Home() {
                 </div>
                 <div className="absolute bottom-0 left-0 right-0 h-10 pointer-events-none" style={{background:"linear-gradient(to top,#030712,transparent)"}}/>
               </div>
-              <p className="mono text-[10px] text-zinc-700 text-center">formato · <span className="text-zinc-500">{resultado.deteccao?.formato_detectado}</span></p>
+
+              {/* Refino: itera sobre o prompt sem recomeçar o pipeline inteiro */}
+              <div className="rounded-xl border border-zinc-800/60 bg-zinc-900/40 overflow-hidden">
+                <button onClick={()=>setMostrarRefino(r=>!r)} aria-expanded={mostrarRefino}
+                  className="w-full flex items-center gap-2 px-4 py-3 text-left hover:bg-zinc-900/60 transition-colors">
+                  <RefreshCw className="w-3.5 h-3.5 text-blue-400 shrink-0"/>
+                  <span className="text-xs font-bold text-zinc-300">Refinar este prompt</span>
+                  <span className="mono text-[10px] text-zinc-500 ml-auto">
+                    {versoes.length > 0 ? `${versoes.length} refino${versoes.length>1?"s":""}` : "sem recomeçar do zero"}
+                  </span>
+                  {mostrarRefino ? <ChevronUp className="w-3.5 h-3.5 text-zinc-500"/> : <ChevronDown className="w-3.5 h-3.5 text-zinc-500"/>}
+                </button>
+
+                <AnimatePresence>
+                  {mostrarRefino && (
+                    <motion.div initial={{opacity:0,height:0}} animate={{opacity:1,height:"auto"}} exit={{opacity:0,height:0}}
+                      className="overflow-hidden border-t border-zinc-800/60 px-4 py-3 space-y-2">
+                      <div className="flex gap-2">
+                        <input value={instrucaoRefino} onChange={e=>setInstrucaoRefino(e.target.value)}
+                          onKeyDown={e=>{ if(e.key==="Enter") refinar(instrucaoRefino); }}
+                          disabled={loading} aria-label="O que melhorar no prompt"
+                          placeholder="ex: mais específico na stack, adicione tratamento de erro..."
+                          className="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-blue-500/30 disabled:opacity-40 transition-colors"/>
+                        <button onClick={()=>refinar(instrucaoRefino)} disabled={loading||!instrucaoRefino.trim()}
+                          aria-label="Aplicar refino"
+                          className="px-3 py-2 rounded-lg bg-blue-500/10 border border-blue-500/30 text-blue-400 disabled:opacity-30 hover:bg-blue-500/20 transition-colors">
+                          <Send className="w-3.5 h-3.5"/>
+                        </button>
+                      </div>
+                      <p className="mono text-[10px] text-zinc-500">
+                        O prompt atual é preservado no histórico antes de cada refino.
+                      </p>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {versoes.length > 0 && (
+                  <div className="border-t border-zinc-800/60 px-4 py-3 space-y-1.5">
+                    <p className="mono text-[10px] text-zinc-500 uppercase tracking-widest">Histórico</p>
+                    {versoes.map((v,i)=>(
+                      <div key={i} className="flex items-center gap-2">
+                        <RotateCcw className="w-3 h-3 text-zinc-600 shrink-0"/>
+                        <span className="mono text-[10px] text-zinc-400 flex-1 truncate" title={v.instrucao}>
+                          v{i+1} · {v.instrucao}
+                        </span>
+                        <span className="mono text-[10px] text-zinc-500 shrink-0">score {v.score}</span>
+                        <button onClick={()=>restaurarVersao(i)}
+                          className="mono text-[10px] text-blue-400 hover:text-blue-300 shrink-0 transition-colors">
+                          restaurar
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <p className="mono text-[10px] text-zinc-600 text-center">formato · <span className="text-zinc-400">{resultado.deteccao?.formato_detectado}</span></p>
             </motion.div>
           )}
         </AnimatePresence>

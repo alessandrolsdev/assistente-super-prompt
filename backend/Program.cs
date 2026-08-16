@@ -1,43 +1,101 @@
-using ApiAssistente.Controllers;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
+using ApiAssistente.Configuration;
+using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
-const string OpenRouterApiKeyMissingMessage =
-    "OpenRouterApiKey nao configurada. Defina a chave via variavel de ambiente, dotnet user-secrets ou appsettings.Development.json local.";
+
+const string CorsPolicyName = "PermitirNextJs";
 
 // ==========================================
-// 1. SERVI?OS
+// 1. SERVIÇOS
 // ==========================================
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddControllers()
     .AddJsonOptions(opts =>
     {
-        // Aceita TipoObjetivo como string ("Imagem", "Codigo"...) alem de numero
-        opts.JsonSerializerOptions.Converters.Add(
-            new System.Text.Json.Serialization.JsonStringEnumConverter()
-        );
+        // Aceita TipoObjetivo como string ("Imagem", "Codigo"...) além de número
+        opts.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
     });
 
-// ALTERA??O: Tipado para injetar corretamente no PromptController
-builder.Services.AddHttpClient<PromptController>(client =>
+builder.Services.AddOptions<OpenRouterOptions>()
+    .Bind(builder.Configuration.GetSection(OpenRouterOptions.SectionName))
+    .PostConfigure(opts =>
+    {
+        // Compatibilidade com o formato documentado no README: a chave também pode
+        // vir da raiz da configuração como "OpenRouterApiKey".
+        if (string.IsNullOrWhiteSpace(opts.ApiKey))
+            opts.ApiKey = builder.Configuration["OpenRouterApiKey"];
+
+        opts.ApiKey = opts.ApiKey?.Trim();
+    });
+
+// HttpClient nomeado: o pipeline resolve via IHttpClientFactory, o que evita
+// depender da ativação de controllers pelo container para injetar HttpClient.
+builder.Services.AddHttpClient(OpenRouterOptions.HttpClientName, (sp, client) =>
 {
-    // Timeout global generoso ? cada chamada individual tem seu pr?prio CancellationToken de 90s
-    client.Timeout = TimeSpan.FromMinutes(8);
+    var opts = sp.GetRequiredService<IOptions<OpenRouterOptions>>().Value;
+    // Timeout global generoso — cada chamada individual tem seu próprio
+    // CancellationToken (OpenRouterOptions.TimeoutSeconds).
+    client.Timeout = TimeSpan.FromMinutes(opts.HttpClientTimeoutMinutes);
 });
 
-// CORS para o Next.js
+builder.Services.Configure<ApiProtecaoOptions>(
+    builder.Configuration.GetSection(ApiProtecaoOptions.SectionName));
+
+// Rate limiting: cada POST em /api/prompt dispara ate 7 chamadas pagas ao
+// OpenRouter, entao a rota precisa de teto mesmo em uso legitimo.
+var protecao = builder.Configuration
+    .GetSection(ApiProtecaoOptions.SectionName)
+    .Get<ApiProtecaoOptions>() ?? new ApiProtecaoOptions();
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.AddFixedWindowLimiter(ApiProtecaoOptions.RateLimitPolicy, limite =>
+    {
+        limite.PermitLimit = protecao.RequisicoesPorJanela;
+        limite.Window = TimeSpan.FromSeconds(protecao.JanelaSegundos);
+        limite.QueueLimit = protecao.Fila;
+        limite.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+    });
+
+    options.OnRejected = async (contexto, cancellationToken) =>
+    {
+        contexto.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        await contexto.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            erro = $"Limite de {protecao.RequisicoesPorJanela} requisicoes por {protecao.JanelaSegundos}s atingido. Tente novamente em instantes."
+        }, cancellationToken);
+    };
+});
+
+// CORS para o Next.js. As origens são configuráveis para não travar o deploy.
+var origensPermitidas = builder.Configuration
+    .GetSection("Cors:AllowedOrigins")
+    .Get<string[]>();
+
+if (origensPermitidas is null || origensPermitidas.Length == 0)
+    origensPermitidas = new[] { "http://localhost:3000" };
+
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("PermitirNextJs", policy =>
+    options.AddPolicy(CorsPolicyName, policy =>
     {
-        policy.WithOrigins("http://localhost:3000")
+        policy.WithOrigins(origensPermitidas)
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
 });
 
 // ==========================================
-// 2. CONSTRU??O DA APLICA??O
+// 2. CONSTRUÇÃO DA APLICAÇÃO
 // ==========================================
 var app = builder.Build();
 
@@ -50,44 +108,59 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// UseHttpsRedirection removido ? em dev local s? usamos HTTP (localhost:5117)
-app.UseCors("PermitirNextJs");
-app.UseAuthorization();
-app.MapControllers();
+// UseHttpsRedirection removido — em dev local só usamos HTTP (localhost:5117).
+app.UseCors(CorsPolicyName);
+app.UseRateLimiter();
+app.UseMiddleware<ApiKeyMiddleware>();
+
+if (!protecao.ExigeApiKey)
+{
+    app.Logger.LogWarning(
+        "ApiProtecao:ApiKey nao configurada: /api/prompt esta aberta. Cada requisicao " +
+        "gasta credito do OpenRouter — defina uma chave antes de expor esta API na rede.");
+}
+
+app.MapControllers().RequireRateLimiting(ApiProtecaoOptions.RateLimitPolicy);
 
 // ==========================================
 // 4. ENDPOINT DE TESTE DE MODELOS
 // Acesse: GET /api/modelos/testar
-// Testa os 3 modelos do pipeline antes de usar
+// Testa os modelos reais do pipeline antes de usar.
 // ==========================================
-app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFactory httpClientFactory) =>
+app.MapGet("/api/modelos/testar", async (
+    IOptions<OpenRouterOptions> optionsAccessor,
+    IHttpClientFactory httpClientFactory,
+    ILoggerFactory loggerFactory,
+    CancellationToken cancellationToken) =>
 {
-    var apiKey = config["OpenRouterApiKey"]?.Trim();
+    var options = optionsAccessor.Value;
+    var logger = loggerFactory.CreateLogger("Diagnostico.Modelos");
 
-    if (string.IsNullOrEmpty(apiKey))
-        return Results.Json(new { erro = OpenRouterApiKeyMissingMessage }, statusCode: StatusCodes.Status503ServiceUnavailable);
-
-    var modelos = new[]
+    if (!options.TemApiKey)
     {
-        new { nome = "An?lise",   id = "arcee-ai/trinity-large-preview:free",           etapa = 1 },
-        new { nome = "Gera??o",   id = "meta-llama/llama-3.3-70b-instruct:free",        etapa = 2 },
-        new { nome = "Valida??o", id = "mistralai/mistral-small-3.1-24b-instruct:free", etapa = 3 },
-    };
+        return Results.Json(
+            new { erro = OpenRouterOptions.ApiKeyMissingMessage },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
 
-    var resultados = new List<object>();
-    var client = httpClientFactory.CreateClient();
+    // Os modelos testados são exatamente os do pipeline — antes esta lista era
+    // uma cópia independente e podia divergir do que o PromptController usava.
+    var modelos = options.Models.Distintos();
+    var client = httpClientFactory.CreateClient(OpenRouterOptions.HttpClientName);
+    var resultados = new List<ResultadoDiagnostico>(modelos.Count);
 
-    foreach (var modelo in modelos)
+    for (var i = 0; i < modelos.Count; i++)
     {
+        var modelo = modelos[i];
         var inicio = DateTime.UtcNow;
-        string status;
+        bool disponivel;
         string detalhe;
 
         try
         {
             var payload = new
             {
-                model = modelo.id,
+                model = modelo,
                 max_tokens = 50,
                 temperature = 0.1,
                 messages = new[]
@@ -96,61 +169,59 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
                 }
             };
 
-            using var request = new HttpRequestMessage(HttpMethod.Post, "https://openrouter.ai/api/v1/chat/completions");
-            request.Headers.Add("Authorization", $"Bearer {apiKey}");
-            request.Headers.Add("HTTP-Referer", "https://apiassistente.local");
+            using var request = new HttpRequestMessage(HttpMethod.Post, options.BaseUrl);
+            request.Headers.Add("Authorization", $"Bearer {options.ApiKey}");
+            request.Headers.Add("HTTP-Referer", options.Referer);
             request.Headers.Add("X-Title", "ApiAssistente - Teste de Modelos");
             request.Content = new StringContent(
-                System.Text.Json.JsonSerializer.Serialize(payload),
-                System.Text.Encoding.UTF8,
-                "application/json"
-            );
+                JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
-            var resposta = await client.SendAsync(request);
-            var json = await resposta.Content.ReadAsStringAsync();
+            using var resposta = await client.SendAsync(request, cancellationToken);
+            var json = await resposta.Content.ReadAsStringAsync(cancellationToken);
+            var node = JsonNode.Parse(json);
 
             if (resposta.IsSuccessStatusCode)
             {
-                var node = System.Text.Json.Nodes.JsonNode.Parse(json);
                 var texto = node?["choices"]?[0]?["message"]?["content"]?.ToString();
-                status  = "? online";
-                detalhe = string.IsNullOrWhiteSpace(texto) ? "Respondeu (sem texto)" : $"Respondeu: \"{texto.Trim()}\"";
+                disponivel = true;
+                detalhe = string.IsNullOrWhiteSpace(texto)
+                    ? "Respondeu (sem texto)"
+                    : $"Respondeu: \"{texto.Trim()}\"";
             }
             else
             {
                 // Tenta extrair a mensagem de erro do OpenRouter
-                var node = System.Text.Json.Nodes.JsonNode.Parse(json);
-                var msg  = node?["error"]?["message"]?.ToString() ?? resposta.StatusCode.ToString();
-                status  = "? offline";
-                detalhe = msg;
+                disponivel = false;
+                detalhe = node?["error"]?["message"]?.ToString() ?? resposta.StatusCode.ToString();
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
-            status  = "? erro";
+            logger.LogWarning(ex, "Falha ao testar o modelo {Modelo}", modelo);
+            disponivel = false;
             detalhe = ex.Message;
         }
 
-        var latencia = (DateTime.UtcNow - inicio).TotalMilliseconds;
-
-        resultados.Add(new
-        {
-            etapa        = modelo.etapa,
-            nome         = modelo.nome,
-            modelo       = modelo.id,
-            status,
-            detalhe,
-            latencia_ms  = Math.Round(latencia)
-        });
+        resultados.Add(new ResultadoDiagnostico(
+            Etapa: i + 1,
+            Modelo: modelo,
+            Disponivel: disponivel,
+            Status: disponivel ? "online" : "offline",
+            Detalhe: detalhe,
+            LatenciaMs: Math.Round((DateTime.UtcNow - inicio).TotalMilliseconds)));
     }
 
-    var todosOnline = resultados.All(r => r.ToString()!.Contains("online"));
+    var online = resultados.Count(r => r.Disponivel);
 
     return Results.Ok(new
     {
-        pipeline_pronto = resultados.Cast<dynamic>().All(r => ((string)r.status).Contains("online")),
-        resumo          = $"{resultados.Count(r => r.ToString()!.Contains("online"))}/3 modelos dispon?veis",
-        modelos         = resultados
+        pipeline_pronto = online == resultados.Count,
+        resumo = $"{online}/{resultados.Count} modelos disponiveis",
+        modelos = resultados
     });
 })
 .WithName("TestarModelos")
@@ -161,9 +232,18 @@ app.MapGet("/api/modelos/testar", async (IConfiguration config, IHttpClientFacto
 // ==========================================
 app.Run();
 
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
+internal sealed record ResultadoDiagnostico(
+    [property: JsonPropertyName("etapa")]       int Etapa,
+    [property: JsonPropertyName("modelo")]      string Modelo,
+    [property: JsonPropertyName("disponivel")]  bool Disponivel,
+    [property: JsonPropertyName("status")]      string Status,
+    [property: JsonPropertyName("detalhe")]     string Detalhe,
+    [property: JsonPropertyName("latencia_ms")] double LatenciaMs);
 
+/// <summary>
+/// Torna publica a classe Program implicita das top-level statements, para que
+/// o WebApplicationFactory dos testes de integracao consiga alcanca-la.
+/// O record WeatherForecast do template `dotnet new webapi`, que ficava aqui,
+/// era codigo morto e foi removido.
+/// </summary>
 public partial class Program { }
