@@ -12,5 +12,11 @@
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Os helpers puros de parsing e normalizacao sao `internal static` para
+         ficarem testaveis sem subir o servidor. -->
+    <InternalsVisibleTo Include="ApiAssistente.Tests" />
+  </ItemGroup>
+
 </Project>
 

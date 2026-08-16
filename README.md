@@ -100,13 +100,34 @@ Alem da chave, a secao `OpenRouter` permite ajustar o pipeline sem recompilar. T
 
 Os ids de modelo default sao modelos gratuitos do OpenRouter e mudam de disponibilidade com frequencia. Use `GET /api/modelos/testar` para confirmar quais estao respondendo antes de investigar erros no pipeline.
 
+### Protecao das rotas
+
+Cada POST em `/api/prompt` dispara ate 7 chamadas pagas ao OpenRouter, entao a
+rota tem rate limit sempre ativo e chave de API opcional:
+
+| Chave | Padrao | Para que serve |
+| --- | --- | --- |
+| `ApiProtecao:ApiKey` | vazia | Quando preenchida, exige o header `X-Api-Key` em `/api/prompt` |
+| `ApiProtecao:RequisicoesPorJanela` | `20` | Teto de requisicoes por janela |
+| `ApiProtecao:JanelaSegundos` | `60` | Tamanho da janela |
+| `ApiProtecao:Fila` | `2` | Requisicoes excedentes que aguardam em vez de serem rejeitadas |
+
+Sem `ApiKey` a API fica aberta e o startup registra um aviso — aceitavel em
+localhost, nao em rede.
+
 ### Frontend: URL da API
 
 Copie [frontend/.env.example](frontend/.env.example) para `frontend/.env.local` e ajuste se o backend nao estiver em `http://localhost:5117`:
 
 ```bash
 NEXT_PUBLIC_API_BASE_URL=http://localhost:5117
+NEXT_PUBLIC_API_KEY=
 ```
+
+`NEXT_PUBLIC_API_KEY` so e necessaria quando o backend define `ApiProtecao:ApiKey`.
+Por ser `NEXT_PUBLIC_`, ela vai para o bundle e e visivel a quem abrir a pagina:
+protege contra abuso casual, nao contra um usuario determinado. Para um deploy
+publico, mantenha a chave no servidor atras de um route handler do Next.
 
 ---
 
@@ -146,16 +167,17 @@ _O frontend fica disponivel em `http://localhost:3000`._
 ## Verificacoes Locais
 
 ```bash
-# Frontend: tipos, lint e build de producao
+# Frontend: tipos, lint, testes e build de producao
 cd frontend
 npm run check
 
-# Backend
-cd backend
-dotnet build
+# Backend: build e testes
+dotnet build backend/ApiAssistente.csproj
+dotnet test  backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
 ```
 
-Ainda nao existe suite de testes automatizados nem CI. Veja o [relatorio de auditoria](docs/audit/2026-08-auditoria.md) e o [target state](docs/architecture/target-state.md).
+O [CI](.github/workflows/ci.yml) roda os dois em cada pull request, mais uma
+verificacao de encoding UTF-8 sobre todos os arquivos versionados.
 
 ---
 
@@ -171,10 +193,14 @@ Para medir a disponibilidade dos modelos usados na pipeline, use o endpoint:
 
 ## Documentacao
 
+- [AGENTS.md](AGENTS.md) — convencoes do repositorio e regra de documentos de trabalho
 - [ADR-001: Modular Monolith First](docs/architecture/adr-001-modular-monolith-first.md)
 - [Current State](docs/architecture/current-state.md)
 - [Target State](docs/architecture/target-state.md)
-- [Auditoria de codigo (2026-08)](docs/audit/2026-08-auditoria.md)
+
+Auditorias, relatorios e anotacoes ficam **locais** e nao sao versionados
+(ver [AGENTS.md](AGENTS.md)). O que precisa sobreviver a eles vira issue, ADR ou
+teste de regressao.
 
 ---
 

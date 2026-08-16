@@ -9,6 +9,9 @@ import {
   Image as ImageIcon, Film, Code2, GitBranch, PenTool, Layout,
   HelpCircle, X, ChevronDown, ChevronUp
 } from "lucide-react";
+import { postApi, foiCancelado, mensagemDeErro } from "@/lib/api";
+import { salvarLocal, lerLocal } from "@/lib/storage";
+import { baixarTexto, nomeDeArquivo, copiar, lerScore, corDoScore, offsetDoScore } from "@/lib/format";
 
 // ─────────────────────────────────────────────────────────────
 // TIPOS
@@ -99,13 +102,6 @@ interface ClarificacaoResult {
 
 type ResultData = PromptResult | PlanoResult | ClarificacaoResult;
 
-/** Corpo de erro devolvido pelo backend (contrato de `PromptController`). */
-interface ApiErro {
-  erro?: string;
-  detalhes?: string;
-  trace_id?: string;
-}
-
 // ─────────────────────────────────────────────────────────────
 // CONFIGURAÇÕES DOS OBJETIVOS
 // ─────────────────────────────────────────────────────────────
@@ -123,9 +119,6 @@ const CHARS = "01アイウエカキ∆∑∏∫≈≠∞";
 
 // A URL base vem do ambiente (ver frontend/.env.example); o localhost fica
 // apenas como padrão de desenvolvimento.
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:5117").replace(/\/+$/, "");
-const API   = `${API_BASE}/api/prompt`;
-
 const LS_KEY_QUEUE     = "pa_queue_v8";
 const LS_KEY_PROJETO   = "pa_projeto_v8";
 const LS_KEY_RESULTADO = "pa_resultado_v8";
@@ -133,6 +126,17 @@ const LS_KEY_PREFS     = "pa_prefs_v1";
 const LS_KEY_CONTEXTO  = "pa_contexto_v1";
 
 const PREFS_PADRAO: Preferencias = { nivelDetalhe: "Equilibrado", idiomaSaida: "auto", executorAlvo: "" };
+
+/** Roteiro das etapas do pipeline, exibido durante a geração (estimativa). */
+const STAGES = [
+  { label: "Classificando objetivo",       color: "text-pink-400",   bg: "bg-pink-500/10",   border: "border-pink-500/20"   },
+  { label: "Verificando ambiguidades",     color: "text-rose-400",   bg: "bg-rose-500/10",   border: "border-rose-500/20"   },
+  { label: "Triando complexidade",         color: "text-amber-400",  bg: "bg-amber-500/10",  border: "border-amber-500/20"  },
+  { label: "Detectando papel técnico",     color: "text-yellow-400", bg: "bg-yellow-500/10", border: "border-yellow-500/20" },
+  { label: "Análise especializada",        color: "text-blue-400",   bg: "bg-blue-500/10",   border: "border-blue-500/20"   },
+  { label: "Gerando super prompt",         color: "text-lime-400",   bg: "bg-lime-500/10",   border: "border-lime-500/20"   },
+  { label: "Validando e calculando score", color: "text-purple-400", bg: "bg-purple-500/10", border: "border-purple-500/20" },
+];
 
 // ─────────────────────────────────────────────────────────────
 // PREFERÊNCIAS DE SAÍDA
@@ -160,138 +164,6 @@ const EXECUTORES: { id: string; label: string; icon: string; desc: string }[] = 
   { id: "OpenHands",    label: "OpenHands",   icon: "◉", desc: "Agente autônomo: setup, verificação e condição de parada explícitos" },
   { id: "Cursor",       label: "Cursor",      icon: "◎", desc: "Editor: escopo curto, arquivos nomeados, alteração como diff" },
   { id: "Windsurf",     label: "Windsurf",    icon: "◍", desc: "Editor com indexação: plano antes das edições, escopo de arquivos" },
-];
-
-// ─────────────────────────────────────────────────────────────
-// CLIENTE DA API
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Lê a resposta do backend tratando os três casos que antes passavam batido:
- * status de erro, corpo vazio e corpo que não é JSON. Sem isso, um 500 virava
- * um objeto sem `tipo_resposta` e o chamador seguia como se nada tivesse
- * acontecido.
- */
-async function lerRespostaApi<T>(res: Response): Promise<T> {
-  const texto = await res.text();
-
-  let data: unknown = null;
-  if (texto) {
-    try { data = JSON.parse(texto); } catch { /* resposta não-JSON: tratada abaixo */ }
-  }
-
-  if (!res.ok) {
-    const erro = data as ApiErro | null;
-    throw new Error(erro?.erro ?? erro?.detalhes ?? `Erro ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`);
-  }
-
-  if (data === null) throw new Error("A API respondeu sem conteúdo utilizável.");
-
-  return data as T;
-}
-
-async function postApi<T>(rota: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${API}/${rota}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-    });
-  } catch (e) {
-    // Cancelamento pelo usuário não é falha de conexão: propaga para o chamador
-    // distinguir (o backend também aborta as chamadas ao OpenRouter).
-    if (foiCancelado(e)) throw e;
-    throw new Error(`Não foi possível falar com a API em ${API_BASE}. Verifique se o backend está rodando.`);
-  }
-  return lerRespostaApi<T>(res);
-}
-
-function foiCancelado(e: unknown): boolean {
-  return e instanceof DOMException && e.name === "AbortError";
-}
-
-function mensagemDeErro(e: unknown): string {
-  return e instanceof Error ? e.message : "Erro desconhecido.";
-}
-
-// ─────────────────────────────────────────────────────────────
-// PERSISTÊNCIA LOCAL
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Grava no localStorage. Valores vazios REMOVEM a chave — antes a fila só era
- * escrita quando tinha itens, então apagar todas as tarefas não limpava nada e
- * elas voltavam no reload seguinte.
- */
-function salvarLocal(chave: string, valor: unknown) {
-  try {
-    const vazio = valor == null || (Array.isArray(valor) && valor.length === 0);
-    if (vazio) localStorage.removeItem(chave);
-    else localStorage.setItem(chave, JSON.stringify(valor));
-  } catch {
-    // Quota estourada ou storage indisponível: a persistência é best-effort.
-  }
-}
-
-function lerLocal<T>(chave: string): T | null {
-  try {
-    const raw = localStorage.getItem(chave);
-    return raw ? (JSON.parse(raw) as T) : null;
-  } catch {
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// UTILITÁRIOS
-// ─────────────────────────────────────────────────────────────
-
-function baixarTexto(conteudo: string, nome: string) {
-  const url = URL.createObjectURL(new Blob([conteudo], { type: "text/plain;charset=utf-8" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = nome;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-/** Títulos vêm do LLM e podem trazer `/`, `:` e afins, inválidos em nome de arquivo. */
-function nomeDeArquivo(titulo: string): string {
-  const limpo = titulo.replace(/[^\p{L}\p{N} _-]/gu, "").trim().slice(0, 40);
-  return limpo || "prompt";
-}
-
-async function copiar(texto: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(texto);
-    return true;
-  } catch {
-    // clipboard exige contexto seguro (https ou localhost).
-    return false;
-  }
-}
-
-/** Converte o score do backend, que pode vir como "N/A", em número utilizável. */
-function lerScore(valor: string | undefined): number | null {
-  const n = Number.parseInt(valor ?? "", 10);
-  return Number.isFinite(n) ? Math.min(Math.max(n, 0), 100) : null;
-}
-
-function corDoScore(score: number | null): string {
-  if (score === null) return "#71717a";
-  return score >= 85 ? "#a3e635" : score >= 70 ? "#facc15" : "#f87171";
-}
-
-const STAGES = [
-  { label: "Classificando objetivo",       color: "text-pink-400",   bg: "bg-pink-500/10",   border: "border-pink-500/20"   },
-  { label: "Verificando ambiguidades",     color: "text-rose-400",   bg: "bg-rose-500/10",   border: "border-rose-500/20"   },
-  { label: "Triando complexidade",         color: "text-amber-400",  bg: "bg-amber-500/10",  border: "border-amber-500/20"  },
-  { label: "Detectando papel técnico",     color: "text-yellow-400", bg: "bg-yellow-500/10", border: "border-yellow-500/20" },
-  { label: "Análise especializada",        color: "text-blue-400",   bg: "bg-blue-500/10",   border: "border-blue-500/20"   },
-  { label: "Gerando super prompt",         color: "text-lime-400",   bg: "bg-lime-500/10",   border: "border-lime-500/20"   },
-  { label: "Validando e calculando score", color: "text-purple-400", bg: "bg-purple-500/10", border: "border-purple-500/20" },
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -1126,7 +998,7 @@ export default function Home() {
   // strokeDasharray do anel de score saía inválido.
   const scoreNum   = lerScore(resultado?.pipeline?.score_qualidade);
   const scoreColor = corDoScore(scoreNum);
-  const scoreDash  = scoreNum === null ? 226 : 226 - (226 * scoreNum) / 100;
+  const scoreDash  = offsetDoScore(scoreNum);
 
   return (
     <div className="relative min-h-screen overflow-hidden flex flex-col items-center py-12 px-6" style={{background:"#030712"}}>

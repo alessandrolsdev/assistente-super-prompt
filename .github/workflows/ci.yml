@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancela execucoes antigas do mesmo branch quando chega um push novo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (.NET 8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: |
+          dotnet restore backend/ApiAssistente.csproj
+          dotnet restore backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+
+      - name: Build
+        run: dotnet build backend/ApiAssistente.csproj --configuration Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+          --configuration Release
+          --logger "console;verbosity=normal"
+
+  frontend:
+    name: Frontend (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+        env:
+          # O build e estatico e nao chama a API; o valor so precisa existir.
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:5117
+
+  encoding:
+    name: Encoding UTF-8
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Os arquivos do backend ja foram corrompidos uma vez por um editor
+      # gravando em code page local: acentos viraram "?" e U+FFFD dentro dos
+      # prompts enviados ao LLM, degradando o produto sem nenhum erro visivel.
+      # Este job impede a reincidencia.
+      - name: Verificar ausencia de U+FFFD e arquivos nao-UTF-8
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, sys
+
+          EXT = {".cs", ".ts", ".tsx", ".md", ".json", ".css", ".yml", ".yaml", ".csproj"}
+          SUBSTITUICAO = chr(0xFFFD)  # nunca escrever o caractere literal aqui
+
+          # Apenas arquivos versionados: documentos de trabalho ficam locais
+          # e fora do repositorio por decisao do AGENTS.md.
+          rastreados = subprocess.run(
+              ["git", "ls-files", "-z"], capture_output=True, text=True, check=True
+          ).stdout.split("\0")
+
+          problemas = []
+          for s in filter(None, rastreados):
+              p = pathlib.Path(s)
+              if not p.is_file() or p.suffix not in EXT: continue
+              try:
+                  t = p.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  problemas.append(f"{s}: nao e UTF-8 valido")
+                  continue
+              if SUBSTITUICAO in t:
+                  problemas.append(f"{s}: {t.count(SUBSTITUICAO)} caractere(s) U+FFFD")
+
+          if problemas:
+              print("Problemas de encoding encontrados:\n")
+              for x in problemas: print(f"  - {x}")
+              print("\nO backend ja foi corrompido assim uma vez, com acentos virando '?'")
+              print("e U+FFFD dentro dos prompts enviados ao LLM. Regrave em UTF-8.")
+              sys.exit(1)
+          print(f"Encoding OK: {len(rastreados)} arquivos versionados, todos UTF-8 limpo.")
+          PY

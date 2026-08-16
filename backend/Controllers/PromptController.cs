@@ -546,7 +546,7 @@ Prompt auditado:
     /// obrigada a copiar o prompt inteiro de volta, o que dobrava o custo em
     /// tokens da etapa mais pesada e era a principal fonte de truncamento.
     /// </summary>
-    private static string ResolverPromptFinal(
+    internal static string ResolverPromptFinal(
         string promptGerado, string tagGeracao, string textoValidacao, int tamanhoMinimo)
     {
         var precisaCorrecao = string.Equals(
@@ -935,7 +935,7 @@ Tarefa: '{ideia}'",
         });
     }
 
-    private static string ExtrairScore(string validacao)
+    internal static string ExtrairScore(string validacao)
     {
         var scoreRaw = ExtrairTagXmlRobusto(validacao, "score");
         if (string.IsNullOrWhiteSpace(scoreRaw)) return "N/A";

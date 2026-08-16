@@ -2,7 +2,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using ApiAssistente.Configuration;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -43,6 +45,37 @@ builder.Services.AddHttpClient(OpenRouterOptions.HttpClientName, (sp, client) =>
     client.Timeout = TimeSpan.FromMinutes(opts.HttpClientTimeoutMinutes);
 });
 
+builder.Services.Configure<ApiProtecaoOptions>(
+    builder.Configuration.GetSection(ApiProtecaoOptions.SectionName));
+
+// Rate limiting: cada POST em /api/prompt dispara ate 7 chamadas pagas ao
+// OpenRouter, entao a rota precisa de teto mesmo em uso legitimo.
+var protecao = builder.Configuration
+    .GetSection(ApiProtecaoOptions.SectionName)
+    .Get<ApiProtecaoOptions>() ?? new ApiProtecaoOptions();
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.AddFixedWindowLimiter(ApiProtecaoOptions.RateLimitPolicy, limite =>
+    {
+        limite.PermitLimit = protecao.RequisicoesPorJanela;
+        limite.Window = TimeSpan.FromSeconds(protecao.JanelaSegundos);
+        limite.QueueLimit = protecao.Fila;
+        limite.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
+    });
+
+    options.OnRejected = async (contexto, cancellationToken) =>
+    {
+        contexto.HttpContext.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        await contexto.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            erro = $"Limite de {protecao.RequisicoesPorJanela} requisicoes por {protecao.JanelaSegundos}s atingido. Tente novamente em instantes."
+        }, cancellationToken);
+    };
+});
+
 // CORS para o Next.js. As origens são configuráveis para não travar o deploy.
 var origensPermitidas = builder.Configuration
     .GetSection("Cors:AllowedOrigins")
@@ -77,7 +110,17 @@ if (app.Environment.IsDevelopment())
 
 // UseHttpsRedirection removido — em dev local só usamos HTTP (localhost:5117).
 app.UseCors(CorsPolicyName);
-app.MapControllers();
+app.UseRateLimiter();
+app.UseMiddleware<ApiKeyMiddleware>();
+
+if (!protecao.ExigeApiKey)
+{
+    app.Logger.LogWarning(
+        "ApiProtecao:ApiKey nao configurada: /api/prompt esta aberta. Cada requisicao " +
+        "gasta credito do OpenRouter — defina uma chave antes de expor esta API na rede.");
+}
+
+app.MapControllers().RequireRateLimiting(ApiProtecaoOptions.RateLimitPolicy);
 
 // ==========================================
 // 4. ENDPOINT DE TESTE DE MODELOS

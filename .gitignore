@@ -41,9 +41,11 @@ frontend/.env*.local
 # =========================
 # .NET / C# (Backend)
 # =========================
-# Pastas de compilacao (binarios pesados)
-backend/bin/
-backend/obj/
+# Pastas de compilacao (binarios pesados) — inclui os projetos de teste
+backend/**/bin/
+backend/**/obj/
+backend/TestResults/
+backend/**/TestResults/
 
 # Arquivo de configuracao sensivel local
 backend/appsettings.Development.json
@@ -54,6 +56,32 @@ backend/appsettings.*.json
 *.user
 *.suo
 .vscode/
+
+# =========================
+# Documentos de trabalho (ver AGENTS.md)
+# =========================
+# Auditorias, relatorios, analises e anotacoes descrevem um momento: ficam
+# obsoletos rapido e nao pertencem ao historico do repositorio. O que precisa
+# sobreviver a eles vira issue, ADR ou teste de regressao.
+docs/audit/
+docs/notes/
+.notes/
+scratch/
+tmp/
+*.local.md
+AUDITORIA*.md
+AUDIT*.md
+RELATORIO*.md
+ANALISE*.md
+NOTES.md
+SCRATCH.md
+TODO.local.md
+
+# Documentacao que E contrato do projeto continua versionada
+!README.md
+!AGENTS.md
+!CONTRIBUTING.md
+!docs/architecture/
 
 # =========================
 # OS / Geral
