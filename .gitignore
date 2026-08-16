@@ -42,8 +42,6 @@ frontend/.env*.local
 # .NET / C# (Backend)
 # =========================
 # Pastas de compila??o (Arquivos bin?rios pesados)
-backend/bin/
-backend/obj/
 backend/**/bin/
 backend/**/obj/
 backend/**/TestResults/
@@ -57,6 +55,22 @@ backend/appsettings.*.json
 *.user
 *.suo
 .vscode/
+
+# =========================
+# Documentos de trabalho
+# =========================
+# Auditorias, relatorios e anotacoes descrevem um momento: ficam obsoletos
+# rapido e nao pertencem ao historico. O que precisa sobreviver a eles vira
+# issue, ADR ou teste de regressao.
+docs/audit/
+docs/notes/
+.notes/
+scratch/
+*.local.md
+AUDITORIA*.md
+RELATORIO*.md
+ANALISE*.md
+NOTES.md
 
 # =========================
 # OS / Geral
