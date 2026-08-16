@@ -171,9 +171,9 @@ _O frontend fica disponivel em `http://localhost:3000`._
 cd frontend
 npm run check
 
-# Backend: build e testes
-dotnet build backend/ApiAssistente.csproj
-dotnet test  backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+# Backend: build e testes (solution na raiz)
+dotnet build assistente-super-prompt.sln
+dotnet test  assistente-super-prompt.sln
 ```
 
 O [CI](.github/workflows/ci.yml) roda os dois em cada pull request, mais uma

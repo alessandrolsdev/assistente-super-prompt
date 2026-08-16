@@ -239,3 +239,11 @@ internal sealed record ResultadoDiagnostico(
     [property: JsonPropertyName("status")]      string Status,
     [property: JsonPropertyName("detalhe")]     string Detalhe,
     [property: JsonPropertyName("latencia_ms")] double LatenciaMs);
+
+/// <summary>
+/// Torna publica a classe Program implicita das top-level statements, para que
+/// o WebApplicationFactory dos testes de integracao consiga alcanca-la.
+/// O record WeatherForecast do template `dotnet new webapi`, que ficava aqui,
+/// era codigo morto e foi removido.
+/// </summary>
+public partial class Program { }

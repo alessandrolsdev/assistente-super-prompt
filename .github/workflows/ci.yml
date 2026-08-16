@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "claude/**", "feat/**", "fix/**", "chore/**"]
+    branches: [main, "claude/**", "test/**", "feat/**", "fix/**", "chore/**"]
   pull_request:
   workflow_dispatch:
 
@@ -26,17 +26,16 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Restore
-        run: |
-          dotnet restore backend/ApiAssistente.csproj
-          dotnet restore backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+        run: dotnet restore assistente-super-prompt.sln
 
       - name: Build
-        run: dotnet build backend/ApiAssistente.csproj --configuration Release --no-restore
+        run: dotnet build assistente-super-prompt.sln --configuration Release --no-restore
 
       - name: Test
         run: >
-          dotnet test backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+          dotnet test assistente-super-prompt.sln
           --configuration Release
+          --no-build
           --logger "console;verbosity=normal"
 
   frontend:

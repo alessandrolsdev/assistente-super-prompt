@@ -61,9 +61,9 @@ descartável, e versioná-lo cria a ilusão de que está sempre atualizado.
 # Frontend: tipos, lint, testes e build
 cd frontend && npm run check
 
-# Backend: build e testes
-dotnet build backend/ApiAssistente.csproj
-dotnet test  backend/tests/ApiAssistente.Tests/ApiAssistente.Tests.csproj
+# Backend: build e testes (solution na raiz)
+dotnet build assistente-super-prompt.sln
+dotnet test  assistente-super-prompt.sln
 ```
 
 Nunca reporte uma mudança como pronta sem rodar o que dá para rodar no ambiente,
