@@ -9,30 +9,37 @@ It is intentionally descriptive, not aspirational.
 
 ```text
 .
+├─ .github/workflows/ci.yml
+├─ assistente-super-prompt.sln
+├─ AGENTS.md
 ├─ backend/
-│  ├─ Configuration/OpenRouterOptions.cs
+│  ├─ Configuration/
+│  │  ├─ OpenRouterOptions.cs
+│  │  ├─ ApiProtecaoOptions.cs
+│  │  └─ ApiKeyMiddleware.cs
 │  ├─ Controllers/PromptController.cs
-│  ├─ Models/PromptModels.cs
+│  ├─ Models/
+│  │  ├─ PromptModels.cs
+│  │  └─ ExecutorPerfis.cs
+│  ├─ ApiAssistente.Tests/
+│  │  ├─ Unit/
+│  │  └─ Smoke/
 │  ├─ Program.cs
 │  ├─ ApiAssistente.csproj
-│  ├─ appsettings.json
 │  └─ appsettings.Example.json
 ├─ frontend/
-│  ├─ src/app/page.tsx
-│  ├─ src/app/layout.tsx
-│  ├─ src/app/globals.css
+│  ├─ src/app/          (page.tsx, layout.tsx, globals.css)
+│  ├─ src/lib/          (api, storage, format + testes)
 │  ├─ .env.example
 │  └─ package.json
-└─ docs/
-   ├─ architecture/
-   └─ audit/
+└─ docs/architecture/
 ```
 
 Observed gaps in the repository root:
 
-- There is no `.sln` or dedicated backend test project yet.
+- `assistente-super-prompt.sln` groups the API and its test project.
 - CI runs backend build/test, frontend check and a UTF-8 encoding gate.
-- There is no frontend feature/module split yet.
+- The frontend has no feature/module split yet; only `src/lib/` was extracted from the page.
 
 ## Backend Today
 
@@ -82,7 +89,7 @@ This means the current backend boundary is controller-centric, not service-centr
 
 - Rule orchestration, integration and HTTP concerns are still tightly coupled in one controller.
 - Configuration is now isolated in `Configuration/OpenRouterOptions.cs`, but orchestration and the OpenRouter gateway are not.
-- Pure parsing and normalization helpers are `internal static` and covered by `backend/tests/ApiAssistente.Tests`.
+- Pure parsing and normalization helpers are `internal static` and covered by `backend/ApiAssistente.Tests` (unit and startup smoke tests).
 - Routes under `/api/prompt` have a fixed-window rate limiter and an optional `X-Api-Key` check (`ApiProtecao`).
 
 ## Frontend Today
@@ -156,7 +163,7 @@ The current contract is functional but not formally versioned or centralized.
 - [`README.md`](../../README.md) now reflects safer local secret handling, but it is not yet the full architecture source of truth.
 - `docs/architecture/` contains the ADR, this document and the target state.
 - Audit reports and working notes are deliberately NOT versioned (see `AGENTS.md`).
-- There is still no repository-level CI pipeline in `.github/workflows`.
+- `.github/workflows/ci.yml` runs three jobs on every push and pull request: backend build/test over the solution, frontend typecheck/lint/test/build, and a UTF-8 encoding gate over all tracked files.
 
 ## What should be preserved right now
 
