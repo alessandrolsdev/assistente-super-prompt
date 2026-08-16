@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "test/**", "feat/**", "fix/**", "chore/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (.NET 8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore assistente-super-prompt.sln
+
+      - name: Build
+        run: dotnet build assistente-super-prompt.sln --configuration Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test assistente-super-prompt.sln
+          --configuration Release
+          --no-build
+          --logger "console;verbosity=normal"
